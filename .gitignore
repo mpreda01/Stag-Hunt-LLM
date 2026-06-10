@@ -1,0 +1,8 @@
+*.pyc
+.idea
+/logs
+*~
+Pipfile
+Pipfile.lock
+*.egg-info/
+build
