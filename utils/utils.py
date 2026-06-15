@@ -5,6 +5,8 @@ from pathlib import Path
 from dataclasses import dataclass, field
 from typing import Any
 from utils.const import SYSTEM_PROMPT
+from agents.qwen4b import query_llm
+import time
 
 @dataclass
 class RolloutFrame:
@@ -107,7 +109,7 @@ def run_random_rollout(policy_fn, env_factory, steps=200, agent_obs_type="coords
 
 
 
-def obs_to_prompt(obs, agent: str, grid_size=(5, 5)) -> str | tuple[str, str]:
+def obs_to_prompt(obs, grid_size=(5, 5)) -> str | tuple[str, str]:
     """
     Convert coords observation to prompt(s).
     - Single agent (obs shape (10,)): pass agent="A" or "B", returns one prompt.
@@ -123,7 +125,7 @@ def obs_to_prompt(obs, agent: str, grid_size=(5, 5)) -> str | tuple[str, str]:
         )
     else:
         # Single agent
-        return build_prompt(obs, agent=agent, grid_size=grid_size)
+        return build_prompt(obs, agent="A", grid_size=grid_size)
 
 
 def build_prompt(obs, agent: str, grid_size=(5, 5)) -> str:
@@ -149,3 +151,44 @@ def build_prompt(obs, agent: str, grid_size=(5, 5)) -> str:
                 What is your next move? Think about where the Stag will be next turn, and whether your teammate can also reach it.
                 ACTION:"""
 
+def run_llm_rollout(
+    env_factory,
+    steps: int = 200,
+    agent_obs_type: str = "coords",
+    think: bool = False,
+    **env_kwargs
+) -> list[RolloutFrame]:
+    
+    env = env_factory(obs_type=agent_obs_type, load_renderer=True, **env_kwargs)
+    obs, info = env.reset()
+    multiagent = bool(getattr(env, "enable_multiagent", True))
+
+    frames = []
+    frames.append(RolloutFrame(
+        step=0, obs=obs, actions=None, rewards=None,
+        pixel_frame=get_pixel_frame(env, multiagent), info=info,
+    ))
+
+    for step in range(1, steps + 1):
+        print(f"\n\n=== Step {step} ===")
+        start_time = time.time()
+        if multiagent:
+            prompt_a, prompt_b = obs_to_prompt(obs)
+            action_a, _ = query_llm(prompt_a, think=think)
+            action_b, _ = query_llm(prompt_b, think=think)
+            actions = [action_a, action_b]
+        else:
+            prompt_a, _ = obs_to_prompt(obs, agent="A")  # single agent always A
+            action_a, _ = query_llm(prompt_a, think=think)
+            actions = action_a
+
+        obs, rewards, terminated, truncated, info = env.step(actions)
+        frames.append(RolloutFrame(
+            step=step, obs=obs, actions=actions, rewards=rewards,
+            pixel_frame=get_pixel_frame(env, multiagent), info=info,
+        ))
+        print("time: ", time.time() - start_time)
+        if terminated or truncated:
+            break
+
+    return frames

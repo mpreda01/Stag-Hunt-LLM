@@ -22,3 +22,10 @@ Always reason step by step, then output your action on the last line in the form
 ACTION: <LEFT|DOWN|RIGHT|UP>
 
 """
+
+ACTION_MAP = {
+    "LEFT": 0,
+    "DOWN": 1,
+    "RIGHT": 2,
+    "UP": 3,
+}
