@@ -4,9 +4,9 @@ import pandas as pd
 from pathlib import Path
 from dataclasses import dataclass, field
 from typing import Any
-from utils.const import SYSTEM_PROMPT
-from agents.qwen4b import query_llm
+from agents.qwen4b import query_llm, obs_to_prompt
 import time
+from agents.random_policy import random_policy
 
 @dataclass
 class RolloutFrame:
@@ -83,7 +83,7 @@ def save_rollout_csv(multiagent: bool, frames: list[RolloutFrame], output_path: 
     
     df.to_csv(output_path, index=False)
     
-def run_random_rollout(policy_fn, env_factory, steps=200, agent_obs_type="coords", **env_kwargs) -> list[RolloutFrame]:
+def run_random_rollout(env_factory, steps=200, agent_obs_type="coords", **env_kwargs) -> list[RolloutFrame]:
     env = env_factory(obs_type=agent_obs_type, load_renderer=True, **env_kwargs)
     obs, info = env.reset()
     multiagent = bool(getattr(env, "enable_multiagent", True))
@@ -95,7 +95,7 @@ def run_random_rollout(policy_fn, env_factory, steps=200, agent_obs_type="coords
     ))
 
     for step in range(1, steps + 1):
-        actions = policy_fn(obs, env, info)
+        actions = random_policy(obs, env, info)
         obs, rewards, terminated, truncated, info = env.step(actions)
         frames.append(RolloutFrame(
             step=step, obs=obs, actions=actions, rewards=rewards,
@@ -107,52 +107,9 @@ def run_random_rollout(policy_fn, env_factory, steps=200, agent_obs_type="coords
     return frames
 
 
-
-
-def obs_to_prompt(obs, grid_size=(5, 5)) -> str | tuple[str, str]:
-    """
-    Convert coords observation to prompt(s).
-    - Single agent (obs shape (10,)): pass agent="A" or "B", returns one prompt.
-    - Multiagent (obs shape (2,10)): returns (prompt_A, prompt_B) tuple, agent param ignored.
-    """
-    obs = np.array(obs)
-
-    if obs.ndim == 2:
-        # Multiagent: row 0 is A's view, row 1 is B's view
-        return (
-            build_prompt(obs[0], agent="A", grid_size=grid_size),
-            build_prompt(obs[1], agent="B", grid_size=grid_size),
-        )
-    else:
-        # Single agent
-        return build_prompt(obs, agent="A", grid_size=grid_size)
-
-
-def build_prompt(obs, agent: str, grid_size=(5, 5)) -> str:
-    """Build a single agent prompt from a flat (10,) obs array."""
-    ax, ay = int(obs[0]), int(obs[1])
-    bx, by = int(obs[2]), int(obs[3])
-    sx, sy = int(obs[4]), int(obs[5])
-    plants = [(int(obs[i]), int(obs[i+1])) for i in range(6, len(obs), 2)]
-    plants_str = ", ".join(f"({px},{py})" for px, py in plants)
-
-    teammate = "B" if agent == "A" else "A"
-    # prova a non ritornare SYSTEM_PROMPT per ogni stato, ma solo la descizione, se llm allucina perchè le istruzioni escono dalla context window manda sempre prompt completo
-    return SYSTEM_PROMPT + f"""You are Agent {agent} on a {grid_size[0]}x{grid_size[1]} grid.
-
-                Current positions:
-                - You (Agent {agent}): ({ax},{ay})
-                - Teammate (Agent {teammate}): ({bx},{by})
-                - Stag: ({sx},{sy})
-                - Plants: {plants_str}
-
-                The Stag is moving toward the nearest agent. Your teammate is also trying to catch the Stag cooperatively.
-
-                What is your next move? Think about where the Stag will be next turn, and whether your teammate can also reach it.
-                ACTION:"""
-
 def run_llm_rollout(
     env_factory,
+    prompot_type: str,
     steps: int = 200,
     agent_obs_type: str = "coords",
     think: bool = False,
@@ -173,12 +130,14 @@ def run_llm_rollout(
         print(f"\n\n=== Step {step} ===")
         start_time = time.time()
         if multiagent:
-            prompt_a, prompt_b = obs_to_prompt(obs)
+            prompt_a, prompt_b = obs_to_prompt(obs, prompot_type=prompot_type)
+
             action_a, _ = query_llm(prompt_a, think=think)
             action_b, _ = query_llm(prompt_b, think=think)
             actions = [action_a, action_b]
+            
         else:
-            prompt_a, _ = obs_to_prompt(obs, agent="A")  # single agent always A
+            prompt_a, _ = obs_to_prompt(obs, prompot_type=prompot_type, agent="A")  # single agent always A
             action_a, _ = query_llm(prompt_a, think=think)
             actions = action_a
 

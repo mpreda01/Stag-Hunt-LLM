@@ -1,12 +1,3 @@
-"""Random policies for the Gymnasium Stag Hunt environments.
-
-The grid-based modes all use the same discrete action encoding:
-LEFT = 0, DOWN = 1, RIGHT = 2, UP = 3, STAND = 4.
-
-The envs accept either a single integer action or a pair of actions
-when `enable_multiagent=True`.
-"""
-
 from utils.const import ENV_FACTORIES
 
 
@@ -44,5 +35,4 @@ def run_random_episode(env_name="hunt", steps=1000, multiagent=True, **env_kwarg
 	return history
 
 
-if __name__ == "__main__":
-	run_random_episode(env_name="hunt", obs_type="coords")
+

@@ -1,6 +1,5 @@
-from utils.utils import save_rollout_video, save_rollout_csv, run_llm_rollout, obs_to_prompt
+from utils.utils import save_rollout_video, save_rollout_csv, run_llm_rollout, run_random_rollout
 from utils.const import ENV_FACTORIES
-from agents.qwen4b import query_llm
     
     
   
@@ -9,12 +8,27 @@ from agents.qwen4b import query_llm
 if __name__ == "__main__":
     
     MULTIAGENT = True
-    frames = run_llm_rollout(
+    TASK = "hunt"
+    
+    mode = input("Select agent (press Enter to continue):\n1. Random (default)\n2. Qwen4b zero shot\n3. Qwen4b one shot\n 4. Qwen4b few shot\n> ")
+    if mode == "2" or mode == "3" or mode == "4":
+        print("Using Qwen4b agent")
+        frames = run_llm_rollout(
                 env_factory=ENV_FACTORIES["hunt"],
-                steps=10,
+                steps=200,
                 agent_obs_type="coords",
                 think=False,
+                prompot_type=mode,
             ) 
+    else:
+        print("Using random agent")
+        frames = run_random_rollout(
+            env_factory=ENV_FACTORIES[TASK],
+            steps=200,
+            agent_obs_type="coords",
+        )
+        
+    
 
     print(f"Collected {len(frames)} frames, shape: {frames[0].pixel_frame.shape}")
     
