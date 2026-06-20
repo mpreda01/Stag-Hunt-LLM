@@ -11,6 +11,9 @@ if __name__ == "__main__":
     TASK = "hunt"
     
     mode = input("Select agent (press Enter to continue):\n1. Random (default)\n2. Qwen4b zero shot\n3. Qwen4b one shot\n 4. Qwen4b few shot\n> ")
+    output_path = input("Enter output path for rollout: ")
+    if not output_path:
+        output_path = ""
     if mode == "2" or mode == "3" or mode == "4":
         print("Using Qwen4b agent")
         frames = run_llm_rollout(
@@ -32,11 +35,11 @@ if __name__ == "__main__":
 
     print(f"Collected {len(frames)} frames, shape: {frames[0].pixel_frame.shape}")
     
-    save_rollout_csv(multiagent=MULTIAGENT, frames=frames, output_path="hunt_rollout.csv")
+    save_rollout_csv(multiagent=MULTIAGENT, frames=frames, output_path=output_path + "hunt_rollout.csv")
     print("Rollout csv saved")
 
     # Save BEFORE anything that might call env.close()
-    video_path = save_rollout_video(frames=frames, output_path="hunt_rollout.mp4", fps=4)
+    video_path = save_rollout_video(frames=frames, output_path=output_path + "hunt_rollout.mp4", fps=4)
     print(f"Video saved: {video_path}")
 
 
