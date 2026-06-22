@@ -20,7 +20,7 @@ set -e  # exit immediately on any error
 
 PROJECT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 VENV_DIR="$PROJECT_DIR/venv"
-REPO_URL="https://github.com/giorgiofranceschelli/Gymnasium-Stag-Hunt.git"
+REPO_URL="https://github.com/mpreda01/Stag-Hunt-LLM.git"
 STAG_HUNT_DIR="$PROJECT_DIR/Gymnasium-Stag-Hunt"
 PYTHON="python3"
 
