@@ -26,8 +26,8 @@
 
 set -e
 
-PROJECT_DIR="/scratch.hpc/matteo.preda"
-VENV_DIR="$PROJECT_DIR/rl"
+PROJECT_DIR="/scratch.hpc/matteo.preda/Stag-Hunt-LLM"
+VENV_DIR="/scratch.hpc/matteo.preda/rl"
 
 # --- Job config ---
 MODE="train"            # "train" or "eval"
