@@ -7,7 +7,7 @@
 #SBATCH --ntasks-per-node=1
 #SBATCH --cpus-per-task=8
 #SBATCH --mem=31G
-#SBATCH --partition=l40
+#SBATCH --partition=rtx2080
 #SBATCH --output=/scratch.hpc/matteo.preda/logs/job_%j.out
 #SBATCH --chdir=/scratch.hpc/matteo.preda
 #SBATCH --gres=gpu:1
