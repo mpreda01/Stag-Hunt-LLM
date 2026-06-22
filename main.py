@@ -32,6 +32,10 @@ from utils.utils import (
 from agents.qwen4b import obs_to_prompt
 from agents.llm_policy_agent import LLMEncoder, REINFORCEAgent
 
+import os
+os.environ["HF_HOME"] = "/scratch.hpc/matteo.preda/hf_cache"
+os.environ["TRANSFORMERS_CACHE"] = "/scratch.hpc/matteo.preda/hf_cache"
+
 
 # ---------------------------------------------------------------------------
 # Config
