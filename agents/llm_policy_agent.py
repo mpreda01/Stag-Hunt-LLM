@@ -21,7 +21,6 @@ from transformers import AutoTokenizer, AutoModelForCausalLM, BitsAndBytesConfig
 # ---------------------------------------------------------------------------
 
 ACTION_DIM    = 4
-HIDDEN_DIM    = 2048        # Qwen3-4B last hidden state dimension
 INT_TO_ACTION = {0: "LEFT", 1: "DOWN", 2: "RIGHT", 3: "UP"}
 DEFAULT_MODEL = "Qwen/Qwen3-4B"
 
@@ -62,13 +61,16 @@ class LLMEncoder:
             device_map=device,
         )
         self.model.eval()
-        print("[LLMEncoder] Ready.")
+        # Detect hidden dim from model config — works for any Qwen variant
+        # (Qwen3-4B is 2560, not 2048 as previously assumed)
+        self.hidden_dim = self.model.config.hidden_size
+        print(f"[LLMEncoder] Ready. hidden_dim={self.hidden_dim}")
 
     @torch.no_grad()
     def encode(self, prompt: str) -> torch.Tensor:
         """
         input:  str prompt (~200 tokens)
-        output: Tensor shape (2048,) dtype float32 on CPU
+        output: Tensor shape (hidden_dim,) dtype float32 on CPU
 
         Takes the last hidden layer's last token position as the state embedding.
         No gradients flow — Qwen weights never change.
@@ -82,8 +84,8 @@ class LLMEncoder:
 
         outputs = self.model(**inputs, output_hidden_states=True)
 
-        # hidden_states: tuple of (n_layers+1) tensors, each (1, seq_len, 2048)
-        # Last layer [-1], batch 0, last token [-1] -> (2048,)
+        # hidden_states: tuple of (n_layers+1) tensors, each (1, seq_len, hidden_dim)
+        # Last layer [-1], batch 0, last token [-1] -> (hidden_dim,)
         hidden = outputs.hidden_states[-1][0, -1, :]
         return hidden.float().cpu()
 
@@ -96,11 +98,11 @@ class PolicyHead(nn.Module):
     """
     Maps a frozen LLM hidden state to an action probability distribution.
 
-    input:  (batch, 2048) float32
-    output: (batch, 4)    float32 -- probabilities summing to 1
+    input:  (batch, hidden_dim) float32   -- hidden_dim passed from LLMEncoder
+    output: (batch, 4)          float32   -- probabilities summing to 1
     """
 
-    def __init__(self, hidden_dim: int = HIDDEN_DIM, n_actions: int = ACTION_DIM):
+    def __init__(self, hidden_dim: int, n_actions: int = ACTION_DIM):
         super().__init__()
         self.net = nn.Sequential(
             nn.Linear(hidden_dim, 256),
@@ -146,7 +148,7 @@ class REINFORCEAgent:
         self.agent_id = agent_id
         self.gamma    = gamma
 
-        self.head      = PolicyHead()
+        self.head      = PolicyHead(hidden_dim=encoder.hidden_dim)
         self.optimizer = optim.Adam(self.head.parameters(), lr=lr)
 
         # Accumulated per episode, cleared after update()
@@ -158,7 +160,7 @@ class REINFORCEAgent:
         self.episode_return_history: list[float] = []
 
     def encode(self, prompt: str) -> torch.Tensor:
-        """Encode a text prompt -> (2048,) hidden state via frozen Qwen."""
+        """Encode a text prompt -> (hidden_dim,) hidden state via frozen Qwen."""
         return self.encoder.encode(prompt)
 
     def select_action(self, hidden: torch.Tensor, greedy: bool = False) -> int:
@@ -168,7 +170,7 @@ class REINFORCEAgent:
         Training (greedy=False): stochastic sample, stores log_prob.
         Evaluation (greedy=True): argmax, no log_prob stored.
         """
-        probs = self.head(hidden.unsqueeze(0))      # (1, 4)
+        probs = self.head(hidden.unsqueeze(0))      # (1, 4) action probabilities
 
         if greedy:
             return int(probs.argmax(dim=1).item())
