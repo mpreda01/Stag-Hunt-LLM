@@ -1,114 +1,77 @@
 #!/bin/bash
+#SBATCH --job-name=stag-hunt-llm
+#SBATCH --mail-type=ALL
+#SBATCH --mail-user=matteo.preda2@studio.unibo.it
+#SBATCH --time=12:00:00
+#SBATCH --nodes=1
+#SBATCH --ntasks-per-node=1
+#SBATCH --cpus-per-task=8
+#SBATCH --mem=31G
+#SBATCH --partition=l40
+#SBATCH --output=/scratch.hpc/matteo.preda/logs/job_%j.out
+#SBATCH --chdir=/scratch.hpc/matteo.preda
+#SBATCH --gres=gpu:1
+
 # =============================================================================
-# run.sh — Setup and launch LLM+REINFORCE training on SSH cluster
+# run.sh — SLURM job script for LLM+REINFORCE training on Stag Hunt
 #
-# Usage:
-#   bash run.sh                          # train with default two-shot prompt
-#   bash run.sh --prompt_type 2          # zero-shot
-#   bash run.sh --mode eval \
-#     --checkpoint_a checkpoints/agent_A_latest.pt \
-#     --checkpoint_b checkpoints/agent_B_latest.pt
+# Submit with:
+#   sbatch run.sh                        # train, two-shot (default)
+#   sbatch run.sh --prompt_type 2        # train, zero-shot
+#   sbatch run.sh --prompt_type 3        # train, one-shot
 #
-# All extra arguments are forwarded directly to main.py.
+# Eval (pass extra args after --)  — not supported with sbatch arg forwarding,
+# edit MODE and ARGS below instead.
 # =============================================================================
 
-set -e  # exit immediately on any error
+set -e
+
+PROJECT_DIR="/scratch.hpc/matteo.preda"
+VENV_DIR="$PROJECT_DIR/rl"
+
+# --- Job config ---
+MODE="train"            # "train" or "eval"
+PROMPT_TYPE="4"         # "2"=zero-shot "3"=one-shot "4"=two-shot
+CHECKPOINT_A="$PROJECT_DIR/checkpoints/agent_A_latest.pt"
+CHECKPOINT_B="$PROJECT_DIR/checkpoints/agent_B_latest.pt"
 
 # ---------------------------------------------------------------------------
-# Config — edit these for your cluster
+# Environment setup
 # ---------------------------------------------------------------------------
 
-PROJECT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-VENV_DIR="$PROJECT_DIR/venv"
-REPO_URL="https://github.com/mpreda01/Stag-Hunt-LLM.git"
-STAG_HUNT_DIR="$PROJECT_DIR/Gymnasium-Stag-Hunt"
-PYTHON="python3"
-
-# HuggingFace model — downloaded once, cached in ~/.cache/huggingface
-HF_MODEL="Qwen/Qwen3-4B"
-
-# ---------------------------------------------------------------------------
-# 1. Create virtual environment (skip if already exists)
-# ---------------------------------------------------------------------------
-
-if [ ! -d "$VENV_DIR" ]; then
-    echo "==> Creating virtual environment at $VENV_DIR"
-    $PYTHON -m venv "$VENV_DIR"
-else
-    echo "==> Virtual environment already exists, skipping creation"
-fi
-
-source "$VENV_DIR/bin/activate"
-echo "==> Python: $(which python) — $(python --version)"
-
-# ---------------------------------------------------------------------------
-# 2. Upgrade pip
-# ---------------------------------------------------------------------------
-
-echo "==> Upgrading pip"
-pip install --upgrade pip --quiet
-
-# ---------------------------------------------------------------------------
-# 3. Install PyTorch with CUDA (cluster typically has CUDA 12.1)
-#    Adjust the --index-url if your cluster uses a different CUDA version.
-#    Check with: nvcc --version
-# ---------------------------------------------------------------------------
-
-echo "==> Installing PyTorch (CUDA 12.1)"
-pip install torch torchvision --index-url https://download.pytorch.org/whl/cu121 --quiet
-
-
-# ---------------------------------------------------------------------------
-# 5. Clone and install Gymnasium-Stag-Hunt (skip if already installed)
-# ---------------------------------------------------------------------------
-
-if ! python -c "import gymnasium_stag_hunt" 2>/dev/null; then
-    echo "==> Cloning Gymnasium-Stag-Hunt"
-    if [ ! -d "$STAG_HUNT_DIR" ]; then
-        git clone "$REPO_URL" "$STAG_HUNT_DIR"
-    fi
-    echo "==> Installing Gymnasium-Stag-Hunt"
-    pip install -e "$STAG_HUNT_DIR" --quiet
-else
-    echo "==> gymnasium_stag_hunt already installed, skipping"
-fi
-
-# ---------------------------------------------------------------------------
-# 6. Pre-download HuggingFace model (optional but avoids timeout mid-training)
-# ---------------------------------------------------------------------------
-
-echo "==> Pre-downloading HuggingFace model: $HF_MODEL"
-python - <<EOF
-from transformers import AutoTokenizer, AutoModelForCausalLM
-print(f"Downloading tokenizer...")
-AutoTokenizer.from_pretrained("$HF_MODEL")
-print(f"Downloading model config (weights downloaded at first training run)...")
-from transformers import AutoConfig
-AutoConfig.from_pretrained("$HF_MODEL")
-print("Done.")
-EOF
-
-# ---------------------------------------------------------------------------
-# 7. Create output directories
-# ---------------------------------------------------------------------------
-
-mkdir -p "$PROJECT_DIR/checkpoints"
-mkdir -p "$PROJECT_DIR/results"
-
-# ---------------------------------------------------------------------------
-# 8. Launch main.py — all arguments forwarded from run.sh invocation
-# ---------------------------------------------------------------------------
-
-echo ""
 echo "============================================================"
-echo "  Launching main.py with args: $@"
-echo "  Project dir: $PROJECT_DIR"
+echo "  Job ID:      $SLURM_JOB_ID"
+echo "  Node:        $SLURMD_NODENAME"
 echo "  Start time:  $(date)"
+echo "  Project dir: $PROJECT_DIR"
+echo "  Mode:        $MODE"
+echo "  Prompt type: $PROMPT_TYPE"
 echo "============================================================"
-echo ""
+
+# Activate virtual environment
+source "$VENV_DIR/bin/activate"
+echo "==> Python: $(which python3) — $(python3 --version)"
+
+# Show GPU info
+echo "==> GPU info:"
+nvidia-smi --query-gpu=name,memory.total,memory.free --format=csv,noheader
+
+# ---------------------------------------------------------------------------
+# Launch
+# ---------------------------------------------------------------------------
 
 cd "$PROJECT_DIR"
-python main.py "$@"
+
+if [ "$MODE" = "train" ]; then
+    echo "==> Starting training (prompt_type=$PROMPT_TYPE)"
+    python3 main.py --mode train --prompt_type "$PROMPT_TYPE"
+
+elif [ "$MODE" = "eval" ]; then
+    echo "==> Starting evaluation"
+    python3 main.py --mode eval \
+        --checkpoint_a "$CHECKPOINT_A" \
+        --checkpoint_b "$CHECKPOINT_B"
+fi
 
 echo ""
 echo "============================================================"
