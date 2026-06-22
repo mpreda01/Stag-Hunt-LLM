@@ -60,7 +60,7 @@ CONFIG = {
     "lr":                 1e-3,
 
     # Checkpointing
-    "checkpoint_dir":     "/content/drive/MyDrive/Colab Notebooks/matteo_notebbok/rl/checkpoints",
+    "checkpoint_dir":     "/content/drive/MyDrive/Colab Notebooks/matteo_notebook/rl/checkpoints",
     "checkpoint_every":   50,
 
     # Evaluation
