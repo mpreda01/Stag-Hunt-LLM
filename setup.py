@@ -13,11 +13,35 @@ setup(
     packages=find_packages(),
     include_package_data=True,
     package_data={'gymnasium_stag_hunt': ['assets/*', 'assets/**/*']},
-    install_requires=["gymnasium", "pygame", "opencv-python", "pettingzoo"],
+    install_requires=[
+        # --- Stag Hunt env (original) ---
+        "gymnasium",
+        "pygame",
+        "opencv-python",
+        "pettingzoo",
+
+        # --- Data & utils ---
+        "numpy",
+        "pandas",
+
+        # --- LLM (frozen inference via Ollama, for qwen4b.py) ---
+        "ollama",
+
+        # --- LLM (HuggingFace, for llm_policy_agent.py LLMEncoder) ---
+        "transformers>=4.40.0",
+        "accelerate>=0.27.0",
+        "bitsandbytes>=0.43.0",     # 4-bit quantization (QLoRA)
+
+        # --- RL training ---
+        "torch>=2.2.0",
+
+        # --- Progress bars ---
+        "tqdm",
+    ],
     classifiers=[
         "Programming Language :: Python :: 3",
         "License :: OSI Approved :: MIT License",
         "Operating System :: OS Independent",
     ],
-    python_requires=">=3.9",
+    python_requires=">=3.10",   # bumped from 3.9: project uses str | None syntax
 )
