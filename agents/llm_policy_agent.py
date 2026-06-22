@@ -4,10 +4,10 @@ agents/llm_policy_agent.py
 LLM-encoded REINFORCE agent for cooperative Stag Hunt.
 
 Architecture:
-    text prompt -> Frozen Qwen3-4B (HuggingFace) -> hidden state (2048,) -> PolicyHead MLP -> action probabilities (4,)
+    text prompt -> Frozen Qwen3-4B (HuggingFace) -> hidden state -> PolicyHead MLP -> action probabilities (4,)
 
 Only PolicyHead is trained. Qwen is always frozen.
-Prompts are built via obs_to_prompt() from agents/qwen4b.py, same as the frozen evaluation pipeline.
+Hidden dim is detected automatically from the model config at load time.
 """
 
 import torch
@@ -32,15 +32,15 @@ DEFAULT_MODEL = "Qwen/Qwen3-4B"
 class LLMEncoder:
     """
     Wraps a frozen Qwen3-4B model loaded in 4-bit quantization.
-    Converts a text prompt into a (2048,) float32 hidden state vector.
+    Converts a text prompt into a (hidden_dim,) float32 hidden state vector.
 
-    This is different from agents/qwen4b.py (which uses Ollama for text generation).
-    Here we use HuggingFace Transformers to access the internal hidden states,
-    which Ollama does not expose.
+    hidden_dim is read from model.config.hidden_size automatically,
+    so this works with any Qwen variant (4B=2560, 7B=3584, etc.).
 
     Usage:
         encoder = LLMEncoder()
-        h = encoder.encode("You are Agent A on a 5x5 grid ...")  # (2048,)
+        h = encoder.encode("You are Agent A on a 5x5 grid ...")
+        # h.shape == (2560,) for Qwen3-4B
     """
 
     def __init__(self, model_name: str = DEFAULT_MODEL, device: str = "cuda"):
@@ -61,8 +61,8 @@ class LLMEncoder:
             device_map=device,
         )
         self.model.eval()
-        # Detect hidden dim from model config — works for any Qwen variant
-        # (Qwen3-4B is 2560, not 2048 as previously assumed)
+
+        # Auto-detect hidden dim from model config — no hardcoding needed
         self.hidden_dim = self.model.config.hidden_size
         print(f"[LLMEncoder] Ready. hidden_dim={self.hidden_dim}")
 
@@ -98,8 +98,8 @@ class PolicyHead(nn.Module):
     """
     Maps a frozen LLM hidden state to an action probability distribution.
 
-    input:  (batch, hidden_dim) float32   -- hidden_dim passed from LLMEncoder
-    output: (batch, 4)          float32   -- probabilities summing to 1
+    input:  (batch, hidden_dim) float32
+    output: (batch, 4)          float32 -- probabilities summing to 1
     """
 
     def __init__(self, hidden_dim: int, n_actions: int = ACTION_DIM):
@@ -148,6 +148,7 @@ class REINFORCEAgent:
         self.agent_id = agent_id
         self.gamma    = gamma
 
+        # PolicyHead uses the actual hidden_dim from the loaded model
         self.head      = PolicyHead(hidden_dim=encoder.hidden_dim)
         self.optimizer = optim.Adam(self.head.parameters(), lr=lr)
 
@@ -170,7 +171,7 @@ class REINFORCEAgent:
         Training (greedy=False): stochastic sample, stores log_prob.
         Evaluation (greedy=True): argmax, no log_prob stored.
         """
-        probs = self.head(hidden.unsqueeze(0))      # (1, 4) action probabilities
+        probs = self.head(hidden.unsqueeze(0))      # (1, 4)
 
         if greedy:
             return int(probs.argmax(dim=1).item())
@@ -248,6 +249,7 @@ class REINFORCEAgent:
             "optimizer":              self.optimizer.state_dict(),
             "loss_history":           self.loss_history,
             "episode_return_history": self.episode_return_history,
+            "hidden_dim":             self.encoder.hidden_dim,
         }, path)
         print(f"[Agent {self.agent_id}] Saved -> {path}")
 
