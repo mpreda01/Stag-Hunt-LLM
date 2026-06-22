@@ -25,9 +25,6 @@ pip install --upgrade pip --quiet
 echo "==> Installing PyTorch with CUDA 12.1"
 pip install torch torchvision --index-url https://download.pytorch.org/whl/cu121 --quiet
 
-echo "==> Installing project dependencies"
-pip install -r "$PROJECT_DIR/requirements.txt" --quiet
-
 echo "==> Cloning and installing Gymnasium-Stag-Hunt"
 if [ ! -d "$STAG_HUNT_DIR" ]; then
     git clone "$REPO_URL" "$STAG_HUNT_DIR"
