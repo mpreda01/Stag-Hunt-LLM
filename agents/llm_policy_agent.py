@@ -229,19 +229,26 @@ class REINFORCEAgent:
         obs_before: list,
         obs_after:  list,
         env_reward: float,
-        coeff:      float = 0.1,
+        coeff:      float = 0.5,
     ) -> float:
         """
         Dense reward shaping: small bonus for moving toward the stag.
         obs layout: [ax, ay, bx, by, sx, sy, p1x, p1y, ...]
         Without shaping, most steps return 0 and REINFORCE has no gradient signal.
-        coeff=0.1 keeps shaping small relative to true rewards (+5/-5).
+        coeff=0.5 keeps shaping moderate relative to true rewards (+5/-5).
         """
         dist_before = abs(float(obs_before[0]) - float(obs_before[4])) + \
                       abs(float(obs_before[1]) - float(obs_before[5]))
         dist_after  = abs(float(obs_after[0])  - float(obs_after[4]))  + \
                       abs(float(obs_after[1])  - float(obs_after[5]))
-        return env_reward + coeff * (dist_before - dist_after)
+        shaping = coeff * (dist_before - dist_after)
+
+        # Extra penalty if agent is alone on stag (mauling) — discourage this explicitly
+        if env_reward == -5.0:
+            shaping -= 1.0
+
+        return env_reward + shaping
+   
 
     def save(self, path: str):
         torch.save({
