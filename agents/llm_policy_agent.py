@@ -229,25 +229,31 @@ class REINFORCEAgent:
         obs_before: list,
         obs_after:  list,
         env_reward: float,
-        coeff:      float = 0.5,
+        coeff:      float = 0.3,
     ) -> float:
         """
         Dense reward shaping: small bonus for moving toward the stag.
         obs layout: [ax, ay, bx, by, sx, sy, p1x, p1y, ...]
         Without shaping, most steps return 0 and REINFORCE has no gradient signal.
-        coeff=0.5 keeps shaping moderate relative to true rewards (+5/-5).
+        coeff=0.3 keeps shaping moderate relative to true rewards (+5/-5).
         """
-        dist_before = abs(float(obs_before[0]) - float(obs_before[4])) + \
-                      abs(float(obs_before[1]) - float(obs_before[5]))
-        dist_after  = abs(float(obs_after[0])  - float(obs_after[4]))  + \
-                      abs(float(obs_after[1])  - float(obs_after[5]))
-        shaping = coeff * (dist_before - dist_after)
+        # Distance to stag
+        dist_stag_before = abs(float(obs_before[0]) - float(obs_before[4])) + \
+                        abs(float(obs_before[1]) - float(obs_before[5]))
+        dist_stag_after  = abs(float(obs_after[0])  - float(obs_after[4]))  + \
+                        abs(float(obs_after[1])  - float(obs_after[5]))
+        stag_shaping = coeff * (dist_stag_before - dist_stag_after)
 
-        # Extra penalty if agent is alone on stag (mauling) — discourage this explicitly
-        if env_reward == -5.0:
-            shaping -= 1.0
+        # Distance to teammate — reward converging with partner
+        dist_team_before = abs(float(obs_before[0]) - float(obs_before[2])) + \
+                        abs(float(obs_before[1]) - float(obs_before[3]))
+        dist_team_after  = abs(float(obs_after[0])  - float(obs_after[2]))  + \
+                        abs(float(obs_after[1])  - float(obs_after[3]))
+        team_shaping = coeff * (dist_team_before - dist_team_after)
 
-        return env_reward + shaping
+        return env_reward + stag_shaping + team_shaping
+    
+    
    
 
     def save(self, path: str):

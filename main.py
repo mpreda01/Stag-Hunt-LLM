@@ -57,7 +57,7 @@ CONFIG = {
     # Training
     "total_episodes":     500,
     "reward_shaping":     True,
-    "shaping_coeff":      0.5,
+    "shaping_coeff":      0.3,
 
     # REINFORCE
     "gamma":              0.99,
