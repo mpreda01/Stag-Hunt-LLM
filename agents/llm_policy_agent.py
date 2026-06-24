@@ -101,8 +101,7 @@ class LLMEncoder:
         # hidden_states: tuple of (n_layers+1) tensors, each (1, seq_len, hidden_dim)
         # Last layer [-1], batch 0 -> (seq_len, hidden_dim)
         # Mean pool over seq_len -> (hidden_dim,)
-        hidden = outputs.hidden_states[-1][0]   # (seq_len, hidden_dim)
-        hidden = hidden.mean(dim=0)             # (hidden_dim,)
+        hidden = outputs.hidden_states[-1][0, -1, :]  # last token of last layer
         return hidden.float().cpu()
 
 
