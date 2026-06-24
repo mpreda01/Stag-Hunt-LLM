@@ -82,15 +82,12 @@ class LLMEncoder:
 
     @torch.no_grad()
     def encode(self, prompt: str) -> torch.Tensor:
-        """
-        input:  str prompt (~200 tokens)
-        output: Tensor shape (hidden_dim,) dtype float32 on CPU
-
-        Mean-pools the last hidden layer over all token positions.
-        No gradients flow — Qwen weights never change.
-        """
+        # Remove the trailing "ACTION:" so the last token is the actual
+        # state content, not a fixed suffix identical across all prompts
+        prompt_clean = prompt.rstrip().removesuffix("ACTION:").rstrip()
+        
         inputs = self.tokenizer(
-            prompt,
+            prompt_clean,
             return_tensors="pt",
             truncation=True,
             max_length=512,
@@ -98,10 +95,7 @@ class LLMEncoder:
 
         outputs = self.model(**inputs, output_hidden_states=True)
 
-        # hidden_states: tuple of (n_layers+1) tensors, each (1, seq_len, hidden_dim)
-        # Last layer [-1], batch 0 -> (seq_len, hidden_dim)
-        # Mean pool over seq_len -> (hidden_dim,)
-        hidden = outputs.hidden_states[-1][0, -1, :]  # last token of last layer
+        hidden = outputs.hidden_states[-1][0, -1, :]
         return hidden.float().cpu()
 
 
