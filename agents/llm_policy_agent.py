@@ -190,10 +190,16 @@ class REINFORCEAgent:
         REINFORCE policy gradient update. Called once at the END of each episode.
 
         G_t = r_t + gamma*r_{t+1} + ... (discounted return from step t)
-        loss = -sum( log_prob(a_t) * G_t )
+        loss = -sum( log_prob(a_t) * G_t ) - entropy_coeff * H(pi)
 
         G_t > 0: gradient increases prob of a_t (it was good)
         G_t < 0: gradient decreases prob of a_t (it was bad)
+
+        Entropy bonus H(pi) prevents policy collapse: it penalizes the policy
+        for becoming too deterministic, forcing continued exploration.
+
+        Normalization is skipped when std < 1e-6 (all returns identical)
+        to avoid loss collapsing to zero and killing the gradient.
 
         Backprop flows through PolicyHead only. Qwen is untouched.
         Returns loss value for logging.
@@ -204,11 +210,24 @@ class REINFORCEAgent:
             returns.insert(0, G)
 
         returns_t = torch.tensor(returns, dtype=torch.float32)
-        if len(returns_t) > 1:
+
+        # Normalize only when there is meaningful variance.
+        # When std ~ 0 (all returns identical), skip normalization —
+        # otherwise loss collapses to 0 and weights never update.
+        if len(returns_t) > 1 and returns_t.std().item() > 1e-6:
             returns_t = (returns_t - returns_t.mean()) / (returns_t.std() + 1e-8)
 
-        log_probs = torch.stack(self._log_probs)
-        loss      = -(log_probs * returns_t).sum()
+        log_probs = torch.stack(self._log_probs)        # (T,)
+        policy_loss = -(log_probs * returns_t).sum()
+
+        # Entropy bonus: H(pi) = -sum(p * log(p))
+        # Recompute probabilities from the stored log_probs for entropy.
+        # coeff=0.01 keeps entropy small but prevents full collapse.
+        probs = log_probs.exp()
+        entropy = -(probs * log_probs).sum()
+        entropy_coeff = 0.01
+
+        loss = policy_loss - entropy_coeff * entropy
 
         self.optimizer.zero_grad()
         loss.backward()

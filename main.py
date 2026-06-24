@@ -153,18 +153,24 @@ def run_episode(
         raw_r_a, raw_r_b = float(rewards[0]), float(rewards[1])
 
         # Reward shaping for REINFORCE (training only)
-        # RolloutFrame always stores RAW env rewards for clean logging
+        # RolloutFrame always stores RAW env rewards for clean logging.
+        #
+        # SHARED TEAM REWARD: both agents receive the sum of both rewards.
+        # This forces Agent A to care about Agent B being mauled — without
+        # this, A gets 0 every step, loss collapses to 0, and A never learns.
         if training:
-            store_r_a = REINFORCEAgent.shaped_reward(
+            shaped_r_a = REINFORCEAgent.shaped_reward(
                 obs[0], next_obs[0], raw_r_a, CONFIG["shaping_coeff"]
             ) if CONFIG["reward_shaping"] else raw_r_a
 
-            store_r_b = REINFORCEAgent.shaped_reward(
+            shaped_r_b = REINFORCEAgent.shaped_reward(
                 obs[1], next_obs[1], raw_r_b, CONFIG["shaping_coeff"]
             ) if CONFIG["reward_shaping"] else raw_r_b
 
-            agent_a.store_reward(store_r_a)
-            agent_b.store_reward(store_r_b)
+            team_reward = shaped_r_a + shaped_r_b   # shared cooperative signal
+
+            agent_a.store_reward(team_reward)
+            agent_b.store_reward(team_reward)
 
         frames.append(RolloutFrame(
             step=step,
