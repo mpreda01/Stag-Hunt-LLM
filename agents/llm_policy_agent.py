@@ -4,10 +4,20 @@ agents/llm_policy_agent.py
 LLM-encoded REINFORCE agent for cooperative Stag Hunt.
 
 Architecture:
-    text prompt -> Frozen Qwen3-4B (HuggingFace) -> hidden state -> PolicyHead MLP -> action probabilities (4,)
+    text prompt -> Frozen Qwen3-4B (HuggingFace) -> mean-pooled hidden state -> LayerNorm -> PolicyHead MLP -> action probabilities (4,)
 
 Only PolicyHead is trained. Qwen is always frozen.
 Hidden dim is detected automatically from the model config at load time.
+
+Changes from v1:
+    - Mean pooling over all token positions instead of last-token only
+      (more stable embedding across short templated prompts)
+    - LayerNorm before the first Linear in PolicyHead
+      (LLM hidden states have large magnitude variance that saturates Linear)
+    - Entropy coefficient reduced from 0.01 -> 0.001
+      (prevents entropy term from dominating and keeping policy uniform)
+    - shaped_reward removed entirely
+      (agents receive only raw env rewards; strategy is not injected)
 """
 
 import torch
@@ -33,6 +43,10 @@ class LLMEncoder:
     """
     Wraps a frozen Qwen3-4B model loaded in 4-bit quantization.
     Converts a text prompt into a (hidden_dim,) float32 hidden state vector.
+
+    Uses MEAN POOLING over all token positions in the last hidden layer.
+    This is more stable than last-token for short, templated prompts where
+    the last token is often punctuation or whitespace with low information.
 
     hidden_dim is read from model.config.hidden_size automatically,
     so this works with any Qwen variant (4B=2560, 7B=3584, etc.).
@@ -72,7 +86,7 @@ class LLMEncoder:
         input:  str prompt (~200 tokens)
         output: Tensor shape (hidden_dim,) dtype float32 on CPU
 
-        Takes the last hidden layer's last token position as the state embedding.
+        Mean-pools the last hidden layer over all token positions.
         No gradients flow — Qwen weights never change.
         """
         inputs = self.tokenizer(
@@ -85,8 +99,10 @@ class LLMEncoder:
         outputs = self.model(**inputs, output_hidden_states=True)
 
         # hidden_states: tuple of (n_layers+1) tensors, each (1, seq_len, hidden_dim)
-        # Last layer [-1], batch 0, last token [-1] -> (hidden_dim,)
-        hidden = outputs.hidden_states[-1][0, -1, :]
+        # Last layer [-1], batch 0 -> (seq_len, hidden_dim)
+        # Mean pool over seq_len -> (hidden_dim,)
+        hidden = outputs.hidden_states[-1][0]   # (seq_len, hidden_dim)
+        hidden = hidden.mean(dim=0)             # (hidden_dim,)
         return hidden.float().cpu()
 
 
@@ -98,6 +114,10 @@ class PolicyHead(nn.Module):
     """
     Maps a frozen LLM hidden state to an action probability distribution.
 
+    LayerNorm is applied first to normalise the LLM embedding before the
+    first Linear layer. Without this, large variance in hidden state
+    magnitudes saturates the linear weights and slows / prevents learning.
+
     input:  (batch, hidden_dim) float32
     output: (batch, 4)          float32 -- probabilities summing to 1
     """
@@ -105,6 +125,7 @@ class PolicyHead(nn.Module):
     def __init__(self, hidden_dim: int, n_actions: int = ACTION_DIM):
         super().__init__()
         self.net = nn.Sequential(
+            nn.LayerNorm(hidden_dim),   # normalise LLM embedding magnitude
             nn.Linear(hidden_dim, 256),
             nn.ReLU(),
             nn.Linear(256, 64),
@@ -128,6 +149,10 @@ class REINFORCEAgent:
     They share the same LLMEncoder but have independent PolicyHead weights
     and optimizers -- they learn separately from their own perspective.
 
+    Both agents receive the SHARED TEAM REWARD (raw_r_a + raw_r_b) at each
+    step. No reward shaping is applied — the agents must discover the
+    cooperative strategy purely from the environment signal.
+
     Episode flow:
         for each step:
             hidden = agent.encode(prompt)            # frozen Qwen
@@ -141,7 +166,7 @@ class REINFORCEAgent:
         self,
         encoder: LLMEncoder,
         agent_id: str,          # "A" or "B"
-        lr: float    = 1e-3,
+        lr: float    = 1e-4,    # reduced from 1e-3: LLM embeddings have unpredictable gradient scale
         gamma: float = 0.99,
     ):
         self.encoder  = encoder
@@ -195,8 +220,9 @@ class REINFORCEAgent:
         G_t > 0: gradient increases prob of a_t (it was good)
         G_t < 0: gradient decreases prob of a_t (it was bad)
 
-        Entropy bonus H(pi) prevents policy collapse: it penalizes the policy
-        for becoming too deterministic, forcing continued exploration.
+        Entropy bonus H(pi) prevents policy collapse but uses a small
+        coefficient (0.001) so it does not dominate the loss and keep the
+        policy artificially uniform.
 
         Normalization is skipped when std < 1e-6 (all returns identical)
         to avoid loss collapsing to zero and killing the gradient.
@@ -212,20 +238,19 @@ class REINFORCEAgent:
         returns_t = torch.tensor(returns, dtype=torch.float32)
 
         # Normalize only when there is meaningful variance.
-        # When std ~ 0 (all returns identical), skip normalization —
-        # otherwise loss collapses to 0 and weights never update.
         if len(returns_t) > 1 and returns_t.std().item() > 1e-6:
             returns_t = (returns_t - returns_t.mean()) / (returns_t.std() + 1e-8)
 
         log_probs = torch.stack(self._log_probs)        # (T,)
         policy_loss = -(log_probs * returns_t).sum()
 
-        # Entropy bonus: H(pi) = -sum(p * log(p))
-        # Recompute probabilities from the stored log_probs for entropy.
-        # coeff=0.01 keeps entropy small but prevents full collapse.
+        # Entropy bonus: reduced coefficient 0.001 (was 0.01).
+        # At 0.01, entropy dominated the loss when the policy was nearly uniform
+        # (H ≈ log(4) ≈ 1.386), preventing the policy_loss from ever driving
+        # meaningful weight updates. At 0.001 the bonus is a gentle regulariser.
         probs = log_probs.exp()
         entropy = -(probs * log_probs).sum()
-        entropy_coeff = 0.01
+        entropy_coeff = 0.001
 
         loss = policy_loss - entropy_coeff * entropy
 
@@ -242,38 +267,6 @@ class REINFORCEAgent:
         self._rewards.clear()
 
         return loss_val
-
-    @staticmethod
-    def shaped_reward(
-        obs_before: list,
-        obs_after:  list,
-        env_reward: float,
-        coeff:      float = 0.3,
-    ) -> float:
-        """
-        Dense reward shaping: small bonus for moving toward the stag.
-        obs layout: [ax, ay, bx, by, sx, sy, p1x, p1y, ...]
-        Without shaping, most steps return 0 and REINFORCE has no gradient signal.
-        coeff=0.3 keeps shaping moderate relative to true rewards (+5/-5).
-        """
-        # Distance to stag
-        dist_stag_before = abs(float(obs_before[0]) - float(obs_before[4])) + \
-                        abs(float(obs_before[1]) - float(obs_before[5]))
-        dist_stag_after  = abs(float(obs_after[0])  - float(obs_after[4]))  + \
-                        abs(float(obs_after[1])  - float(obs_after[5]))
-        stag_shaping = coeff * (dist_stag_before - dist_stag_after)
-
-        # Distance to teammate — reward converging with partner
-        dist_team_before = abs(float(obs_before[0]) - float(obs_before[2])) + \
-                        abs(float(obs_before[1]) - float(obs_before[3]))
-        dist_team_after  = abs(float(obs_after[0])  - float(obs_after[2]))  + \
-                        abs(float(obs_after[1])  - float(obs_after[3]))
-        team_shaping = coeff * (dist_team_before - dist_team_after)
-
-        return env_reward + stag_shaping + team_shaping
-    
-    
-   
 
     def save(self, path: str):
         torch.save({

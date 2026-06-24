@@ -8,6 +8,12 @@ Usage:
     python main.py --mode train --prompt_type 4        # two-shot prompt
     python main.py --mode eval  --checkpoint_a checkpoints/agent_A_latest.pt \
                                 --checkpoint_b checkpoints/agent_B_latest.pt
+
+Changes from v1:
+    - reward_shaping removed entirely; shaped_reward() no longer called
+    - Both agents receive raw shared team reward (raw_r_a + raw_r_b) only
+    - lr reduced from 1e-3 to 1e-4 (matches new REINFORCEAgent default)
+    - CONFIG cleaned of shaping_coeff and reward_shaping keys
 """
 
 import argparse
@@ -56,12 +62,12 @@ CONFIG = {
 
     # Training
     "total_episodes":     500,
-    "reward_shaping":     True,
-    "shaping_coeff":      0.3,
 
     # REINFORCE
+    # lr reduced from 1e-3: gradient scale from LLM embeddings is
+    # unpredictable and a smaller step keeps updates stable.
     "gamma":              0.99,
-    "lr":                 1e-3,
+    "lr":                 1e-4,
 
     # Checkpointing
     "checkpoint_dir":     "checkpoints",
@@ -105,8 +111,14 @@ def run_episode(
     Run one full episode with both agents.
     Returns the list of RolloutFrames for the episode.
 
-    Progress is shown via tqdm (one bar per step) if available,
-    otherwise prints step timing every step.
+    Reward design (training only):
+        team_reward = raw_r_a + raw_r_b
+
+        Both agents receive the same team_reward at every step.
+        No shaping is applied — agents must discover cooperation
+        purely from the environment signal.
+
+        raw rewards are still stored in RolloutFrame for clean logging.
     """
     load_renderer = save_video_path is not None
     env = make_env(load_renderer=load_renderer)
@@ -130,7 +142,7 @@ def run_episode(
             range(1, CONFIG["max_timesteps"] + 1),
             desc=f"  {mode_str} ep {episode_idx} steps",
             unit="step",
-            leave=False,          # clears the bar when done, keeps terminal clean
+            leave=False,
             dynamic_ncols=True,
         )
     else:
@@ -152,23 +164,15 @@ def run_episode(
         next_obs, rewards, terminated, truncated, info = env.step([action_a, action_b])
         raw_r_a, raw_r_b = float(rewards[0]), float(rewards[1])
 
-        # Reward shaping for REINFORCE (training only)
-        # RolloutFrame always stores RAW env rewards for clean logging.
-        #
-        # SHARED TEAM REWARD: both agents receive the sum of both rewards.
-        # This forces Agent A to care about Agent B being mauled — without
-        # this, A gets 0 every step, loss collapses to 0, and A never learns.
+        # Shared team reward — no shaping applied.
+        # Each agent sees the sum of both raw rewards so that:
+        #   - a catch   (+5 each)  -> team_reward = +10
+        #   - a mauling (-5 / 0)   -> team_reward = -5
+        #   - forage    (+1 / 0)   -> team_reward = +1
+        # This makes each agent care about its partner's outcome without
+        # telling it HOW to cooperate.
         if training:
-            shaped_r_a = REINFORCEAgent.shaped_reward(
-                obs[0], next_obs[0], raw_r_a, CONFIG["shaping_coeff"]
-            ) if CONFIG["reward_shaping"] else raw_r_a
-
-            shaped_r_b = REINFORCEAgent.shaped_reward(
-                obs[1], next_obs[1], raw_r_b, CONFIG["shaping_coeff"]
-            ) if CONFIG["reward_shaping"] else raw_r_b
-
-            team_reward = shaped_r_a + shaped_r_b   # shared cooperative signal
-
+            team_reward = raw_r_a + raw_r_b
             agent_a.store_reward(team_reward)
             agent_b.store_reward(team_reward)
 
@@ -183,18 +187,18 @@ def run_episode(
 
         step_elapsed = time.time() - step_t0
 
-        # Update tqdm postfix or print timing
         if TQDM_AVAILABLE:
             step_iter.set_postfix({
                 "r_A": f"{raw_r_a:+.1f}",
                 "r_B": f"{raw_r_b:+.1f}",
+                "team": f"{raw_r_a+raw_r_b:+.1f}",
                 "act": f"{action_a},{action_b}",
                 "s/step": f"{step_elapsed:.1f}s",
             })
         else:
             print(
                 f"  [{mode_str}] ep {episode_idx} | step {step:>3} | "
-                f"r_A={raw_r_a:+.1f} r_B={raw_r_b:+.1f} | "
+                f"r_A={raw_r_a:+.1f} r_B={raw_r_b:+.1f} team={raw_r_a+raw_r_b:+.1f} | "
                 f"actions=({action_a},{action_b}) | "
                 f"{step_elapsed:.2f}s"
             )
@@ -242,11 +246,12 @@ def compute_metrics(frames: list[RolloutFrame]) -> dict:
             n_maulings += 1
 
     return {
-        "total_reward_a": total_r_a,
-        "total_reward_b": total_r_b,
-        "n_catches":      n_catches,
-        "n_maulings":     n_maulings,
-        "steps":          len(frames) - 1,
+        "total_reward_a":    total_r_a,
+        "total_reward_b":    total_r_b,
+        "total_team_reward": total_r_a + total_r_b,
+        "n_catches":         n_catches,
+        "n_maulings":        n_maulings,
+        "steps":             len(frames) - 1,
     }
 
 
@@ -260,6 +265,8 @@ def train(prompt_type: str | None = None):
 
     print("=" * 65)
     print(f"  TRAINING: LLM+REINFORCE | prompt_type={CONFIG['prompt_type']}")
+    print(f"  reward: shared team (raw_r_a + raw_r_b), no shaping")
+    print(f"  lr={CONFIG['lr']} | gamma={CONFIG['gamma']}")
     print("=" * 65)
 
     ckpt_dir = Path(CONFIG["checkpoint_dir"])
@@ -283,7 +290,6 @@ def train(prompt_type: str | None = None):
 
     total_eps = CONFIG["total_episodes"]
 
-    # --- Episode-level progress bar ---
     if TQDM_AVAILABLE:
         ep_bar = tqdm(
             range(start_episode, total_eps + 1),
@@ -309,22 +315,22 @@ def train(prompt_type: str | None = None):
             f"steps={metrics['steps']:>3} | "
             f"R_A={metrics['total_reward_a']:>7.2f} | "
             f"R_B={metrics['total_reward_b']:>7.2f} | "
+            f"team={metrics['total_team_reward']:>8.2f} | "
             f"catches={metrics['n_catches']:>2} | "
             f"maulings={metrics['n_maulings']:>2} | "
-            f"loss_A={loss_a:>8.3f} | "
-            f"loss_B={loss_b:>8.3f} | "
+            f"loss_A={loss_a:>8.4f} | "
+            f"loss_B={loss_b:>8.4f} | "
             f"ep_time={ep_elapsed:.1f}s"
         )
 
         if TQDM_AVAILABLE:
             ep_bar.set_postfix({
-                "R_A": f"{metrics['total_reward_a']:.1f}",
-                "R_B": f"{metrics['total_reward_b']:.1f}",
+                "team": f"{metrics['total_team_reward']:.1f}",
                 "catches": metrics["n_catches"],
-                "loss_A": f"{loss_a:.3f}",
+                "loss_A": f"{loss_a:.4f}",
                 "ep_time": f"{ep_elapsed:.1f}s",
             })
-            tqdm.write(summary)   # prints above the bar without breaking it
+            tqdm.write(summary)
         else:
             print(summary)
 
@@ -344,10 +350,11 @@ def train(prompt_type: str | None = None):
             window = min(CONFIG["checkpoint_every"], episode)
             hist_a = agent_a.episode_return_history[-window:]
             hist_b = agent_b.episode_return_history[-window:]
+            # episode_return_history stores the team reward sum per episode
             rolling = (
                 f"\n  --- checkpoint ep {episode} | last {window} eps | "
-                f"avg R_A={sum(hist_a)/window:.2f} | "
-                f"avg R_B={sum(hist_b)/window:.2f} ---\n"
+                f"avg team_R={sum(hist_a)/window:.2f} (A) / "
+                f"{sum(hist_b)/window:.2f} (B) ---\n"
             )
             if TQDM_AVAILABLE:
                 tqdm.write(rolling)
@@ -413,6 +420,7 @@ def evaluate(checkpoint_a: str, checkpoint_b: str):
             f"steps={metrics['steps']:>3} | "
             f"R_A={metrics['total_reward_a']:>7.2f} | "
             f"R_B={metrics['total_reward_b']:>7.2f} | "
+            f"team={metrics['total_team_reward']:>8.2f} | "
             f"catches={metrics['n_catches']:>2} | "
             f"maulings={metrics['n_maulings']:>2} | "
             f"ep_time={ep_elapsed:.1f}s"
@@ -420,7 +428,7 @@ def evaluate(checkpoint_a: str, checkpoint_b: str):
 
         if TQDM_AVAILABLE:
             ep_bar.set_postfix({
-                "R_A": f"{metrics['total_reward_a']:.1f}",
+                "team": f"{metrics['total_team_reward']:.1f}",
                 "catches": metrics["n_catches"],
                 "ep_time": f"{ep_elapsed:.1f}s",
             })
@@ -433,7 +441,7 @@ def evaluate(checkpoint_a: str, checkpoint_b: str):
     print(f"{'='*65}")
     print(f"  Avg reward A:          {total_r_a/n:.2f}")
     print(f"  Avg reward B:          {total_r_b/n:.2f}")
-    print(f"  Avg combined reward:   {(total_r_a+total_r_b)/n:.2f}")
+    print(f"  Avg team reward:       {(total_r_a+total_r_b)/n:.2f}")
     print(f"  Total catches:         {total_catches}")
     print(f"  Catch rate (per step): {100*total_catches/total_steps:.2f}%")
     print(f"  Total maulings:        {total_maulings}")
