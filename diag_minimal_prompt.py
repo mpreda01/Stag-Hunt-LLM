@@ -104,7 +104,7 @@ def main():
     embeddings = {}
     for name, state in STATES.items():
         prompt = build_minimal_prompt(state, agent="A")
-        h = encoder.encode(state)          # uses build_minimal_prompt internally
+        h = encoder.encode(prompt)         # pass the string, not the numpy array
         embeddings[name] = h
         print(f"  {name[:55]:55s}")
         print(f"    norm={h.norm().item():.4f}  "
@@ -195,7 +195,8 @@ def main():
     log_probs = []
     returns   = torch.tensor([2.0, -1.0, 3.0, -2.0, 1.0])
     for state in list(STATES.values())[:5]:
-        h     = encoder.encode(state)
+        prompt = build_minimal_prompt(state, agent="A")
+        h      = encoder.encode(prompt)
         probs = head(h.unsqueeze(0))
         dist  = torch.distributions.Categorical(probs)
         a     = dist.sample()
