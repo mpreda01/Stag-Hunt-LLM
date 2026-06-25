@@ -23,7 +23,6 @@ VENV_DIR="/scratch.hpc/matteo.preda/rl"
 CACHE_DIR="/scratch.hpc/matteo.preda/hf_cache"
 
 MODE="train"
-PROMPT_TYPE="4"
 CHECKPOINT="$PROJECT_DIR/checkpoints/policy_latest"
 
 # Redirect all caches to scratch
@@ -62,8 +61,8 @@ nvidia-smi --query-gpu=name,memory.total,memory.free --format=csv,noheader
 cd "$PROJECT_DIR"
 
 if [ "$MODE" = "train" ]; then
-    echo "==> Starting LoRA+PPO training (prompt_type=$PROMPT_TYPE)"
-    python3 main.py --mode train --prompt_type "$PROMPT_TYPE"
+    echo "==> Starting training"
+    python3 main.py --mode train 
 
 elif [ "$MODE" = "eval" ]; then
     echo "==> Starting evaluation"
