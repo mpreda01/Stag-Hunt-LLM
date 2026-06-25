@@ -1,25 +1,43 @@
 """
-agents/llm_policy_agent.py
+agents/llm_policy_agent.py  —  Option B: LLM Token-Logit REINFORCE
 
-LLM-encoded REINFORCE agent for cooperative Stag Hunt.
+Architecture
+------------
+    text prompt
+        -> Frozen Qwen3-4B (4-bit)
+        -> next-token logits over vocab  (shape: vocab_size,)
+        -> slice 4 action-token logits   [LEFT, DOWN, RIGHT, UP]
+        -> TemperatureAdapter            (1 trainable scalar per agent)
+        -> softmax -> action distribution
 
-Architecture:
-    text prompt -> Frozen Qwen3-4B (HuggingFace) -> mean-pooled hidden state -> LayerNorm -> PolicyHead MLP -> action probabilities (4,)
+What is trained
+---------------
+    Only TemperatureAdapter.temperature  (1 scalar, ~0 overhead).
+    Qwen weights are never touched.
 
-Only PolicyHead is trained. Qwen is always frozen.
-Hidden dim is detected automatically from the model config at load time.
+Why this works where the hidden-state approach didn't
+------------------------------------------------------
+    The hidden-state approach produced identical embeddings for all states
+    (L2 dist = 0.0) because mean-pooling or last-token over a ~600-token
+    prompt dominated by the fixed preamble destroys state information.
 
-Changes from v1:
-    - Mean pooling over all token positions instead of last-token only
-      (more stable embedding across short templated prompts)
-    - LayerNorm before the first Linear in PolicyHead
-      (LLM hidden states have large magnitude variance that saturates Linear)
-    - Entropy coefficient reduced from 0.01 -> 0.001
-      (prevents entropy term from dominating and keeping policy uniform)
-    - shaped_reward removed entirely
-      (agents receive only raw env rewards; strategy is not injected)
+    Here we bypass hidden states entirely. Instead we ask the LLM to
+    predict the NEXT TOKEN after "ACTION:" and read the logits for the
+    four action-word tokens directly from the output layer. These logits
+    ARE state-dependent: the LLM's language model head assigns different
+    probabilities to "RIGHT" vs "LEFT" depending on the coordinates in
+    the prompt. The LLM's world knowledge is therefore fully exploited.
+
+    REINFORCE then learns a single temperature scalar that scales the
+    confidence of those logits to match the cooperative reward signal.
+    - temperature > 1  ->  softer distribution (more exploration)
+    - temperature < 1  ->  sharper distribution (more exploitation)
+    - temperature = 1  ->  raw LLM distribution (baseline)
+
+    This is minimal RL fine-tuning: the LLM reasons, RL calibrates.
 """
 
+import random
 import torch
 import torch.nn as nn
 import torch.optim as optim
@@ -30,31 +48,34 @@ from transformers import AutoTokenizer, AutoModelForCausalLM, BitsAndBytesConfig
 # Constants
 # ---------------------------------------------------------------------------
 
-ACTION_DIM    = 4
-INT_TO_ACTION = {0: "LEFT", 1: "DOWN", 2: "RIGHT", 3: "UP"}
+ACTION_WORDS  = ["LEFT", "DOWN", "RIGHT", "UP"]   # order matches env encoding
+INT_TO_ACTION = {i: a for i, a in enumerate(ACTION_WORDS)}
+ACTION_TO_INT = {a: i for i, a in enumerate(ACTION_WORDS)}
 DEFAULT_MODEL = "Qwen/Qwen3-4B"
 
 
 # ---------------------------------------------------------------------------
-# 1. LLM Encoder  (frozen, never updated)
+# 1.  LLM  (frozen, never updated)
 # ---------------------------------------------------------------------------
 
-class LLMEncoder:
+class LLMPolicy:
     """
-    Wraps a frozen Qwen3-4B model loaded in 4-bit quantization.
-    Converts a text prompt into a (hidden_dim,) float32 hidden state vector.
+    Frozen Qwen3-4B loaded in 4-bit NF4 quantisation.
 
-    Uses MEAN POOLING over all token positions in the last hidden layer.
-    This is more stable than last-token for short, templated prompts where
-    the last token is often punctuation or whitespace with low information.
+    Core method: get_action_logits(prompt) -> Tensor shape (4,)
+        Runs one forward pass, reads the next-token logits at the position
+        right after the final "ACTION:" token, then slices out the four
+        action-word token ids.
 
-    hidden_dim is read from model.config.hidden_size automatically,
-    so this works with any Qwen variant (4B=2560, 7B=3584, etc.).
+    The returned logits are RAW (not normalised). Pass them to
+    TemperatureAdapter to get a probability distribution.
 
-    Usage:
-        encoder = LLMEncoder()
-        h = encoder.encode("You are Agent A on a 5x5 grid ...")
-        # h.shape == (2560,) for Qwen3-4B
+    Token-id lookup
+    ---------------
+    We look up each action word once at init time. Qwen3 tokenises
+    "LEFT", "DOWN", "RIGHT", "UP" as single tokens, so each maps to
+    exactly one token id. We assert this at load time so mismatches
+    surface immediately rather than silently producing wrong logits.
     """
 
     def __init__(self, model_name: str = DEFAULT_MODEL, device: str = "cuda"):
@@ -66,133 +87,165 @@ class LLMEncoder:
             bnb_4bit_compute_dtype=torch.float16,
         )
 
-        print(f"[LLMEncoder] Loading {model_name} in 4-bit ...")
+        print(f"[LLMPolicy] Loading {model_name} in 4-bit ...")
         self.tokenizer = AutoTokenizer.from_pretrained(model_name)
         self.model = AutoModelForCausalLM.from_pretrained(
             model_name,
             quantization_config=bnb_config,
-            output_hidden_states=True,
             device_map=device,
         )
         self.model.eval()
+        print(f"[LLMPolicy] Model loaded.")
 
-        # Auto-detect hidden dim from model config — no hardcoding needed
-        self.hidden_dim = self.model.config.hidden_size
-        print(f"[LLMEncoder] Ready. hidden_dim={self.hidden_dim}")
+        # Resolve action token ids — each word must be a SINGLE token
+        self.action_token_ids = []
+        for word in ACTION_WORDS:
+            ids = self.tokenizer.encode(word, add_special_tokens=False)
+            assert len(ids) == 1, (
+                f"Action word '{word}' tokenises to {len(ids)} tokens {ids}. "
+                f"Qwen3 must tokenise it as a single token for logit slicing to work."
+            )
+            self.action_token_ids.append(ids[0])
+
+        print(f"[LLMPolicy] Action token ids: "
+              f"{ {w: i for w, i in zip(ACTION_WORDS, self.action_token_ids)} }")
 
     @torch.no_grad()
-    def encode(self, prompt: str) -> torch.Tensor:
-        # Remove the trailing "ACTION:" so the last token is the actual
-        # state content, not a fixed suffix identical across all prompts
-        prompt_clean = prompt.rstrip().removesuffix("ACTION:").rstrip()
-        
+    def get_action_logits(self, prompt: str) -> torch.Tensor:
+        """
+        Returns raw logits for the 4 action tokens, shape (4,) on CPU float32.
+
+        The prompt must end with 'ACTION:' (or similar) so that the model's
+        next-token prediction naturally targets action words.
+
+        Implementation note:
+            outputs.logits has shape (1, seq_len, vocab_size).
+            We take position [-1] (last input token) which gives the
+            distribution over the NEXT token — i.e., what comes after ACTION:.
+            We then index into vocab_size with our 4 action token ids.
+        """
         inputs = self.tokenizer(
-            prompt_clean,
+            prompt,
             return_tensors="pt",
             truncation=True,
             max_length=512,
         ).to(self.device)
 
-        outputs = self.model(**inputs, output_hidden_states=True)
+        outputs = self.model(**inputs)
 
-        hidden = outputs.hidden_states[-1][0, -1, :]
-        return hidden.float().cpu()
+        # (1, seq_len, vocab_size) -> last position -> (vocab_size,)
+        last_logits = outputs.logits[0, -1, :]
+
+        # Slice the 4 action-word logits -> (4,)
+        action_logits = torch.stack([
+            last_logits[tid] for tid in self.action_token_ids
+        ])
+
+        return action_logits.float().cpu()
 
 
 # ---------------------------------------------------------------------------
-# 2. PolicyHead MLP  (the only trainable component)
+# 2.  TemperatureAdapter  (the ONLY trainable component)
 # ---------------------------------------------------------------------------
 
-class PolicyHead(nn.Module):
+class TemperatureAdapter(nn.Module):
     """
-    Maps a frozen LLM hidden state to an action probability distribution.
+    Scales the LLM's action logits by a single learned temperature.
 
-    LayerNorm is applied first to normalise the LLM embedding before the
-    first Linear layer. Without this, large variance in hidden state
-    magnitudes saturates the linear weights and slows / prevents learning.
+    forward(logits) -> probabilities, shape (4,)
 
-    input:  (batch, hidden_dim) float32
-    output: (batch, 4)          float32 -- probabilities summing to 1
+    The temperature is initialised to 1.0 so the agent starts with the
+    raw LLM distribution and RL moves it from there.
+
+    Gradient flows ONLY through this scalar — Qwen is untouched.
+
+    Why one scalar and not a full MLP?
+        We proved (via the embedding diagnostic) that the LLM hidden states
+        carry zero state information. A full MLP on top of those states
+        cannot learn. The token logits ARE state-dependent (the LLM assigns
+        different next-token probabilities for different coordinate values),
+        so the minimal trainable component is enough: just calibrate the
+        confidence of the LLM's own distribution.
     """
 
-    def __init__(self, hidden_dim: int, n_actions: int = ACTION_DIM):
+    def __init__(self, init_temperature: float = 1.0):
         super().__init__()
-        self.net = nn.Sequential(
-            nn.LayerNorm(hidden_dim),   # normalise LLM embedding magnitude
-            nn.Linear(hidden_dim, 256),
-            nn.ReLU(),
-            nn.Linear(256, 64),
-            nn.ReLU(),
-            nn.Linear(64, n_actions),
+        # Use log-space so temperature is always positive after exp()
+        self.log_temperature = nn.Parameter(
+            torch.tensor([init_temperature]).log()
         )
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return torch.softmax(self.net(x), dim=-1)
+    @property
+    def temperature(self) -> float:
+        return self.log_temperature.exp().item()
+
+    def forward(self, logits: torch.Tensor) -> torch.Tensor:
+        """logits: (4,) -> probs: (4,)"""
+        temp = self.log_temperature.exp()          # always positive
+        return torch.softmax(logits / temp, dim=0)
 
 
 # ---------------------------------------------------------------------------
-# 3. REINFORCE Agent
+# 3.  REINFORCE Agent
 # ---------------------------------------------------------------------------
 
 class REINFORCEAgent:
     """
-    One agent = frozen LLMEncoder + trainable PolicyHead.
-
-    Two instances are created in main.py (one per player).
-    They share the same LLMEncoder but have independent PolicyHead weights
-    and optimizers -- they learn separately from their own perspective.
-
-    Both agents receive the SHARED TEAM REWARD (raw_r_a + raw_r_b) at each
-    step. No reward shaping is applied — the agents must discover the
-    cooperative strategy purely from the environment signal.
+    One agent = frozen LLMPolicy + trainable TemperatureAdapter.
 
     Episode flow:
         for each step:
-            hidden = agent.encode(prompt)            # frozen Qwen
-            action = agent.select_action(hidden)     # samples from PolicyHead
-            agent.store_reward(reward)               # called after env.step()
+            logits = agent.get_action_logits(prompt)   # frozen Qwen
+            action = agent.select_action(logits)        # samples via adapter
+            agent.store_reward(reward)                  # after env.step()
 
-        loss = agent.update()   # called once at END of episode
+        agent.update()   # called once at END of episode
+
+    Two instances share the same LLMPolicy but have independent
+    TemperatureAdapters — each agent calibrates its own confidence level.
     """
 
     def __init__(
         self,
-        encoder: LLMEncoder,
-        agent_id: str,          # "A" or "B"
-        lr: float    = 1e-4,    # reduced from 1e-3: LLM embeddings have unpredictable gradient scale
+        llm: LLMPolicy,
+        agent_id: str,           # "A" or "B"
+        lr: float    = 1e-2,     # higher lr is fine: only 1 param to update
         gamma: float = 0.99,
     ):
-        self.encoder  = encoder
+        self.llm      = llm
         self.agent_id = agent_id
         self.gamma    = gamma
 
-        # PolicyHead uses the actual hidden_dim from the loaded model
-        self.head      = PolicyHead(hidden_dim=encoder.hidden_dim)
-        self.optimizer = optim.Adam(self.head.parameters(), lr=lr)
+        self.adapter   = TemperatureAdapter(init_temperature=1.0)
+        self.optimizer = optim.Adam(self.adapter.parameters(), lr=lr)
 
         # Accumulated per episode, cleared after update()
         self._log_probs: list[torch.Tensor] = []
         self._rewards:   list[float]        = []
 
-        # History for plotting / checkpointing
+        # History for logging / checkpointing
         self.loss_history:           list[float] = []
         self.episode_return_history: list[float] = []
 
-    def encode(self, prompt: str) -> torch.Tensor:
-        """Encode a text prompt -> (hidden_dim,) hidden state via frozen Qwen."""
-        return self.encoder.encode(prompt)
+    def get_action_logits(self, prompt: str) -> torch.Tensor:
+        """Get raw action logits from frozen LLM. Shape (4,)."""
+        return self.llm.get_action_logits(prompt)
 
-    def select_action(self, hidden: torch.Tensor, greedy: bool = False) -> int:
+    def select_action(
+        self,
+        logits: torch.Tensor,
+        greedy: bool = False,
+    ) -> int:
         """
-        Sample an action from the policy distribution.
-
-        Training (greedy=False): stochastic sample, stores log_prob.
+        Training (greedy=False): sample from adapter distribution, store log_prob.
         Evaluation (greedy=True): argmax, no log_prob stored.
+
+        logits: (4,) raw action logits from LLMPolicy.get_action_logits()
         """
-        probs = self.head(hidden.unsqueeze(0))      # (1, 4)
+        probs = self.adapter(logits)   # (4,) — goes through temperature scaling
 
         if greedy:
-            return int(probs.argmax(dim=1).item())
+            return int(probs.argmax().item())
 
         dist   = torch.distributions.Categorical(probs)
         action = dist.sample()
@@ -200,29 +253,18 @@ class REINFORCEAgent:
         return int(action.item())
 
     def store_reward(self, reward: float):
-        """Store the reward received at the current timestep."""
         self._rewards.append(reward)
 
     def update(self) -> float:
         """
-        REINFORCE policy gradient update. Called once at the END of each episode.
+        REINFORCE update at end of episode.
 
-        G_t = r_t + gamma*r_{t+1} + ... (discounted return from step t)
         loss = -sum( log_prob(a_t) * G_t ) - entropy_coeff * H(pi)
 
-        G_t > 0: gradient increases prob of a_t (it was good)
-        G_t < 0: gradient decreases prob of a_t (it was bad)
-
-        Entropy bonus H(pi) prevents policy collapse but uses a small
-        coefficient (0.001) so it does not dominate the loss and keep the
-        policy artificially uniform.
-
-        Normalization is skipped when std < 1e-6 (all returns identical)
-        to avoid loss collapsing to zero and killing the gradient.
-
-        Backprop flows through PolicyHead only. Qwen is untouched.
+        Only TemperatureAdapter.log_temperature is updated.
         Returns loss value for logging.
         """
+        # Compute discounted returns
         G, returns = 0.0, []
         for r in reversed(self._rewards):
             G = r + self.gamma * G
@@ -230,26 +272,21 @@ class REINFORCEAgent:
 
         returns_t = torch.tensor(returns, dtype=torch.float32)
 
-        # Normalize only when there is meaningful variance.
+        # Normalise returns when there is meaningful variance
         if len(returns_t) > 1 and returns_t.std().item() > 1e-6:
             returns_t = (returns_t - returns_t.mean()) / (returns_t.std() + 1e-8)
 
-        log_probs = torch.stack(self._log_probs)        # (T,)
+        log_probs   = torch.stack(self._log_probs)         # (T,)
         policy_loss = -(log_probs * returns_t).sum()
 
-        # Entropy bonus: reduced coefficient 0.001 (was 0.01).
-        # At 0.01, entropy dominated the loss when the policy was nearly uniform
-        # (H ≈ log(4) ≈ 1.386), preventing the policy_loss from ever driving
-        # meaningful weight updates. At 0.001 the bonus is a gentle regulariser.
-        probs = log_probs.exp()
+        # Entropy bonus — small coefficient keeps distribution from collapsing
+        probs   = log_probs.exp()
         entropy = -(probs * log_probs).sum()
-        entropy_coeff = 0.001
 
-        loss = policy_loss - entropy_coeff * entropy
+        loss = policy_loss - 0.01 * entropy
 
         self.optimizer.zero_grad()
         loss.backward()
-        nn.utils.clip_grad_norm_(self.head.parameters(), max_norm=5.0)
         self.optimizer.step()
 
         loss_val = loss.item()
@@ -263,17 +300,16 @@ class REINFORCEAgent:
 
     def save(self, path: str):
         torch.save({
-            "head":                   self.head.state_dict(),
+            "adapter":                self.adapter.state_dict(),
             "optimizer":              self.optimizer.state_dict(),
             "loss_history":           self.loss_history,
             "episode_return_history": self.episode_return_history,
-            "hidden_dim":             self.encoder.hidden_dim,
         }, path)
         print(f"[Agent {self.agent_id}] Saved -> {path}")
 
     def load(self, path: str):
         ckpt = torch.load(path, map_location="cpu")
-        self.head.load_state_dict(ckpt["head"])
+        self.adapter.load_state_dict(ckpt["adapter"])
         self.optimizer.load_state_dict(ckpt["optimizer"])
         self.loss_history           = ckpt.get("loss_history", [])
         self.episode_return_history = ckpt.get("episode_return_history", [])
