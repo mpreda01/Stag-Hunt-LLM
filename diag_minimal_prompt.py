@@ -149,9 +149,10 @@ def main():
     # 4. Sanity check — same state twice
     # ------------------------------------------------------------------
     section("4. SANITY — same state encoded twice (expect L2 = 0.0)")
-    state0 = list(STATES.values())[0]
-    h1 = encoder.encode(state0)
-    h2 = encoder.encode(state0)
+    state0  = list(STATES.values())[0]
+    prompt0 = build_minimal_prompt(state0, agent="A")
+    h1 = encoder.encode(prompt0)
+    h2 = encoder.encode(prompt0)
     l2_same = l2_dist(h1, h2)
     cs_same = cosine_sim(h1, h2)
     flag = "✓" if l2_same < 1e-4 else "✗ NOT DETERMINISTIC"
