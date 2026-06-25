@@ -6,7 +6,7 @@
 #SBATCH --nodes=1
 #SBATCH --ntasks-per-node=1
 #SBATCH --cpus-per-task=4
-#SBATCH --partition=l40
+#SBATCH --partition=rtx2080
 #SBATCH --output=/scratch.hpc/matteo.preda/logs/job_%j.out
 #SBATCH --chdir=/scratch.hpc/matteo.preda/Stag-Hunt-LLM
 #SBATCH --gres=gpu:1
