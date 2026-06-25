@@ -78,11 +78,11 @@ cd "$PROJECT_DIR"
 
 if [ "$MODE" = "train" ]; then
     echo "==> Starting training (prompt_type=$PROMPT_TYPE)"
-    python3 diag_embedding_similarity.py --mode train --prompt_type "$PROMPT_TYPE"
+    python3 diag_minimal_prompt.py --mode train --prompt_type "$PROMPT_TYPE"
 
 elif [ "$MODE" = "eval" ]; then
     echo "==> Starting evaluation"
-    python3 diag_embedding_similarity.py --mode eval \
+    python3 diag_minimal_prompt.py --mode eval \
         --checkpoint_a "$CHECKPOINT_A" \
         --checkpoint_b "$CHECKPOINT_B"
 fi

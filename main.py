@@ -1,19 +1,28 @@
 """
-main.py  —  LoRA + PPO fine-tuning of Qwen3-4B on Stag Hunt
+main.py  —  Minimal-Prompt LLM Encoder + MLP REINFORCE on Stag Hunt
 
 Architecture:
-    obs -> two-shot prompt
-        -> Qwen3-4B + LoRA (trainable attention adapters)
-        -> sample action from action-token logits
-        -> env.step() -> team reward
-        -> PPO update on LoRA weights + value head
+    raw obs (10 floats)
+        -> minimal prompt (~20 tokens, no preamble)
+        -> Frozen Qwen3-4B  -> mean-pool -> detach -> (hidden_dim,)
+        -> LayerNorm + MLP PolicyHead  (trainable, REINFORCE)
+        -> action
+
+Key idea:
+    The old two-shot prompt had ~600 tokens of fixed preamble and only
+    ~10 state tokens (1.6% state signal) — embeddings were identical
+    across all states (L2 dist = 0.0000).
+
+    The minimal prompt has NO preamble:
+        "agent_a:0,0 teammate:4,0 stag:2,2 plants:1,3,3,1 action:"
+    State tokens are ~43% of the total — embeddings now vary with state.
 
 Usage:
     python main.py --mode train
-    python main.py --mode train --prompt_type 4
-    python main.py --mode eval  --checkpoint checkpoints/policy_ep200
+    python main.py --mode eval --checkpoint_a checkpoints/agent_A_latest.pt \\
+                               --checkpoint_b checkpoints/agent_B_latest.pt
 
-Target hardware: L40 (48 GB VRAM)  —  set --partition=l40 in run.sh
+Target hardware: RTX 2080 (11 GB) — no LoRA backward, Qwen is frozen.
 """
 
 import argparse
@@ -35,8 +44,7 @@ from utils.utils import (
     save_rollout_video,
     save_rollout_csv,
 )
-from agents.qwen4b import obs_to_prompt
-from agents.llm_policy_agent import QwenLoRAPolicy, PPOAgent
+from agents.llm_policy_agent import LLMEncoder, REINFORCEAgent
 
 import os
 os.environ["HF_HOME"]            = "/scratch.hpc/matteo.preda/hf_cache"
@@ -56,23 +64,12 @@ CONFIG = {
     "forage_reward":      1,
     "mauling_punishment": -5,
 
-    # Prompt
-    "prompt_type":        "4",   # 2=zero-shot  3=one-shot  4=two-shot
-
     # Training
-    "total_episodes":     500,
+    "total_episodes": 500,
 
-    # PPO hyperparameters
-    "lr":        1e-4,    # AdamW lr for LoRA params
-    "gamma":     0.99,    # discount factor
-    "clip_eps":  0.2,     # PPO clip ratio
-    "vf_coeff":  0.5,     # value loss coefficient
-    "ent_coeff": 0.01,    # entropy bonus coefficient
-
-    # LoRA
-    "lora_rank":    16,
-    "lora_alpha":   32,
-    "lora_dropout": 0.05,
+    # REINFORCE
+    "gamma": 0.99,
+    "lr":    1e-3,
 
     # Checkpointing
     "checkpoint_dir":   "checkpoints",
@@ -90,13 +87,13 @@ CONFIG = {
 
 def make_env(load_renderer: bool = False):
     return ENV_FACTORIES[CONFIG["env_name"]](
-        obs_type        = "coords",
-        load_renderer   = load_renderer,
-        enable_multiagent = True,
-        grid_size       = CONFIG["grid_size"],
-        max_timesteps   = CONFIG["max_timesteps"],
-        stag_reward     = CONFIG["stag_reward"],
-        forage_reward   = CONFIG["forage_reward"],
+        obs_type           = "coords",
+        load_renderer      = load_renderer,
+        enable_multiagent  = True,
+        grid_size          = CONFIG["grid_size"],
+        max_timesteps      = CONFIG["max_timesteps"],
+        stag_reward        = CONFIG["stag_reward"],
+        forage_reward      = CONFIG["forage_reward"],
         mauling_punishment = CONFIG["mauling_punishment"],
     )
 
@@ -106,23 +103,21 @@ def make_env(load_renderer: bool = False):
 # ---------------------------------------------------------------------------
 
 def run_episode(
-    agent_a: PPOAgent,
-    agent_b: PPOAgent,
+    agent_a: REINFORCEAgent,
+    agent_b: REINFORCEAgent,
     episode_idx: int,
     training:    bool = True,
     save_video_path: str | None = None,
 ) -> list[RolloutFrame]:
     """
-    Run one full episode with both PPO agents.
+    Run one full episode.
 
-    Reward:
-        team_reward = raw_r_a + raw_r_b  (shared, no shaping)
-        Both agents receive the same team reward — each agent cares
-        about its partner's outcome without being told how to cooperate.
+    Each agent encodes its own observation directly from the raw numpy
+    array via build_minimal_prompt() — no obs_to_prompt() needed.
 
-    Both agents share the same QwenLoRAPolicy so both sets of
-    (log_prob, value, entropy) computed in this episode contribute
-    to the same PPO update — doubling the effective batch size.
+    Reward: shared team reward (raw_r_a + raw_r_b), no shaping.
+    Both agents receive the same signal so each cares about the other's
+    outcome without being told how to cooperate.
     """
     load_renderer = save_video_path is not None
     env = make_env(load_renderer=load_renderer)
@@ -143,9 +138,9 @@ def run_episode(
     if TQDM_AVAILABLE:
         step_iter = tqdm(
             range(1, CONFIG["max_timesteps"] + 1),
-            desc         = f"  {mode_str} ep {episode_idx} steps",
-            unit         = "step",
-            leave        = False,
+            desc          = f"  {mode_str} ep {episode_idx} steps",
+            unit          = "step",
+            leave         = False,
             dynamic_ncols = True,
         )
     else:
@@ -154,14 +149,18 @@ def run_episode(
     for step in step_iter:
         step_t0 = time.time()
 
-        prompt_a, prompt_b = obs_to_prompt(obs, prompot_type=CONFIG["prompt_type"])
+        # obs is (2, 10) in multiagent mode: row 0 = A's view, row 1 = B's view
+        # Each agent encodes its own row directly — no shared prompt builder needed
+        hidden_a = agent_a.encode(obs[0])
+        hidden_b = agent_b.encode(obs[1])
 
-        action_a = agent_a.select_action(prompt_a, greedy=not training)
-        action_b = agent_b.select_action(prompt_b, greedy=not training)
+        action_a = agent_a.select_action(hidden_a, greedy=not training)
+        action_b = agent_b.select_action(hidden_b, greedy=not training)
 
         next_obs, rewards, terminated, truncated, info = env.step([action_a, action_b])
         raw_r_a, raw_r_b = float(rewards[0]), float(rewards[1])
 
+        # Shared team reward — cooperative signal, no shaping
         if training:
             team_reward = raw_r_a + raw_r_b
             agent_a.store_reward(team_reward)
@@ -198,11 +197,10 @@ def run_episode(
         if terminated or truncated:
             break
 
-    # PPO update — one per episode, after all steps collected
     if training:
-        loss_a = agent_a.update()
-        loss_b = agent_b.update()
-    
+        agent_a.update()
+        agent_b.update()
+
     if save_video_path and load_renderer:
         save_rollout_video(frames, output_path=save_video_path, fps=4)
         print(f"  Video saved -> {save_video_path}")
@@ -248,14 +246,10 @@ def compute_metrics(frames: list[RolloutFrame]) -> dict:
 # Training
 # ---------------------------------------------------------------------------
 
-def train(prompt_type: str | None = None):
-    if prompt_type:
-        CONFIG["prompt_type"] = prompt_type
-
+def train():
     print("=" * 65)
-    print(f"  TRAINING: Qwen3-4B LoRA + PPO on Stag Hunt")
-    print(f"  prompt_type={CONFIG['prompt_type']} | lr={CONFIG['lr']}")
-    print(f"  lora_rank={CONFIG['lora_rank']} | clip_eps={CONFIG['clip_eps']}")
+    print("  TRAINING: Minimal-Prompt LLM Encoder + MLP REINFORCE")
+    print(f"  lr={CONFIG['lr']} | gamma={CONFIG['gamma']}")
     print("=" * 65)
 
     ckpt_dir = Path(CONFIG["checkpoint_dir"])
@@ -264,45 +258,21 @@ def train(prompt_type: str | None = None):
     device = "cuda" if torch.cuda.is_available() else "cpu"
     print(f"Device: {device}")
     if device == "cuda":
-        print(f"GPU: {torch.cuda.get_device_name(0)}")
-        print(f"VRAM: {torch.cuda.get_device_properties(0).total_memory / 1e9:.1f} GB\n")
+        print(f"GPU:  {torch.cuda.get_device_name(0)}")
+        print(f"VRAM: {torch.cuda.get_device_properties(0).total_memory/1e9:.1f} GB\n")
 
-    # Both agents share one policy (same LoRA weights, different rollout buffers)
-    policy  = QwenLoRAPolicy(
-        device       = device,
-        lora_rank    = CONFIG["lora_rank"],
-        lora_alpha   = CONFIG["lora_alpha"],
-        lora_dropout = CONFIG["lora_dropout"],
-    )
-    agent_a = PPOAgent(
-        policy    = policy,
-        agent_id  = "A",
-        lr        = CONFIG["lr"],
-        gamma     = CONFIG["gamma"],
-        clip_eps  = CONFIG["clip_eps"],
-        vf_coeff  = CONFIG["vf_coeff"],
-        ent_coeff = CONFIG["ent_coeff"],
-    )
-    agent_b = PPOAgent(
-        policy    = policy,
-        agent_id  = "B",
-        lr        = CONFIG["lr"],
-        gamma     = CONFIG["gamma"],
-        clip_eps  = CONFIG["clip_eps"],
-        vf_coeff  = CONFIG["vf_coeff"],
-        ent_coeff = CONFIG["ent_coeff"],
-    )
+    encoder = LLMEncoder(device=device)
+    agent_a = REINFORCEAgent(encoder, agent_id="A",
+                              lr=CONFIG["lr"], gamma=CONFIG["gamma"])
+    agent_b = REINFORCEAgent(encoder, agent_id="B",
+                              lr=CONFIG["lr"], gamma=CONFIG["gamma"])
 
-    # Resume from checkpoint if available
-    ckpt_policy = str(ckpt_dir / "policy_latest")
-    ckpt_a_opt  = str(ckpt_dir / "agent_A_latest")
-    ckpt_b_opt  = str(ckpt_dir / "agent_B_latest")
+    ckpt_a = ckpt_dir / "agent_A_latest.pt"
+    ckpt_b = ckpt_dir / "agent_B_latest.pt"
     start_episode = 1
-
-    if Path(ckpt_policy + "_lora").exists():
-        policy.load(ckpt_policy)
-        agent_a.load(ckpt_a_opt)
-        agent_b.load(ckpt_b_opt)
+    if ckpt_a.exists() and ckpt_b.exists():
+        agent_a.load(str(ckpt_a))
+        agent_b.load(str(ckpt_b))
         start_episode = len(agent_a.episode_return_history) + 1
         print(f"Resuming from episode {start_episode}\n")
 
@@ -321,7 +291,8 @@ def train(prompt_type: str | None = None):
     for episode in ep_bar:
         ep_t0 = time.time()
 
-        frames     = run_episode(agent_a, agent_b, episode_idx=episode, training=True)
+        frames     = run_episode(agent_a, agent_b,
+                                 episode_idx=episode, training=True)
         metrics    = compute_metrics(frames)
         ep_elapsed = time.time() - ep_t0
 
@@ -336,30 +307,27 @@ def train(prompt_type: str | None = None):
             f"team={metrics['total_team_reward']:>8.2f} | "
             f"catches={metrics['n_catches']:>2} | "
             f"maulings={metrics['n_maulings']:>2} | "
-            f"loss_A={loss_a:>8.4f} | "
-            f"loss_B={loss_b:>8.4f} | "
+            f"loss_A={loss_a:>9.4f} | "
+            f"loss_B={loss_b:>9.4f} | "
             f"ep_time={ep_elapsed:.1f}s"
         )
 
         if TQDM_AVAILABLE:
             ep_bar.set_postfix({
-                "team":     f"{metrics['total_team_reward']:.1f}",
-                "catches":  metrics["n_catches"],
-                "loss_A":   f"{loss_a:.4f}",
-                "ep_time":  f"{ep_elapsed:.1f}s",
+                "team":    f"{metrics['total_team_reward']:.1f}",
+                "catches": metrics["n_catches"],
+                "loss_A":  f"{loss_a:.4f}",
+                "ep_time": f"{ep_elapsed:.1f}s",
             })
             tqdm.write(summary)
         else:
             print(summary)
 
         if episode % CONFIG["checkpoint_every"] == 0:
-            ep_tag = str(ckpt_dir / f"policy_ep{episode}")
-            policy.save(ep_tag)
-            agent_a.save(str(ckpt_dir / f"agent_A_ep{episode}"))
-            agent_b.save(str(ckpt_dir / f"agent_B_ep{episode}"))
-            policy.save(ckpt_policy)
-            agent_a.save(ckpt_a_opt)
-            agent_b.save(ckpt_b_opt)
+            agent_a.save(str(ckpt_dir / f"agent_A_ep{episode}.pt"))
+            agent_b.save(str(ckpt_dir / f"agent_B_ep{episode}.pt"))
+            agent_a.save(str(ckpt_a))
+            agent_b.save(str(ckpt_b))
 
             save_rollout_csv(
                 multiagent  = True,
@@ -380,9 +348,8 @@ def train(prompt_type: str | None = None):
             else:
                 print(rolling)
 
-    policy.save(str(ckpt_dir / "policy_final"))
-    agent_a.save(str(ckpt_dir / "agent_A_final"))
-    agent_b.save(str(ckpt_dir / "agent_B_final"))
+    agent_a.save(str(ckpt_dir / "agent_A_final.pt"))
+    agent_b.save(str(ckpt_dir / "agent_B_final.pt"))
     print("\nTraining complete.")
 
 
@@ -390,21 +357,19 @@ def train(prompt_type: str | None = None):
 # Evaluation
 # ---------------------------------------------------------------------------
 
-def evaluate(checkpoint: str):
+def evaluate(checkpoint_a: str, checkpoint_b: str):
     print("=" * 65)
-    print("  EVALUATION: Qwen3-4B LoRA + PPO on Stag Hunt")
+    print("  EVALUATION: Minimal-Prompt LLM Encoder + MLP REINFORCE")
     print("=" * 65)
 
-    device = "cuda" if torch.cuda.is_available() else "cpu"
-    policy  = QwenLoRAPolicy(device=device)
-    agent_a = PPOAgent(policy=policy, agent_id="A",
-                       lr=CONFIG["lr"], gamma=CONFIG["gamma"])
-    agent_b = PPOAgent(policy=policy, agent_id="B",
-                       lr=CONFIG["lr"], gamma=CONFIG["gamma"])
-
-    policy.load(checkpoint)
-    agent_a.load(checkpoint.replace("policy", "agent_A"))
-    agent_b.load(checkpoint.replace("policy", "agent_B"))
+    device  = "cuda" if torch.cuda.is_available() else "cpu"
+    encoder = LLMEncoder(device=device)
+    agent_a = REINFORCEAgent(encoder, agent_id="A",
+                              lr=CONFIG["lr"], gamma=CONFIG["gamma"])
+    agent_b = REINFORCEAgent(encoder, agent_id="B",
+                              lr=CONFIG["lr"], gamma=CONFIG["gamma"])
+    agent_a.load(checkpoint_a)
+    agent_b.load(checkpoint_b)
 
     total_catches  = 0
     total_maulings = 0
@@ -476,13 +441,11 @@ def evaluate(checkpoint: str):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--mode",         choices=["train", "eval"], default="train")
-    parser.add_argument("--prompt_type",  choices=["2", "3", "4"],   default="4",
-                        help="2=zero-shot  3=one-shot  4=two-shot")
-    parser.add_argument("--checkpoint",   default="checkpoints/policy_latest",
-                        help="Path prefix for eval (without _lora suffix)")
+    parser.add_argument("--checkpoint_a", default="checkpoints/agent_A_latest.pt")
+    parser.add_argument("--checkpoint_b", default="checkpoints/agent_B_latest.pt")
     args = parser.parse_args()
 
     if args.mode == "train":
-        train(prompt_type=args.prompt_type)
+        train()
     else:
-        evaluate(args.checkpoint)
+        evaluate(args.checkpoint_a, args.checkpoint_b)
