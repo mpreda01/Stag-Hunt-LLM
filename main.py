@@ -1,15 +1,19 @@
 """
-main.py  —  Option B: LLM Token-Logit REINFORCE on Stag Hunt
+main.py  —  LoRA + PPO fine-tuning of Qwen3-4B on Stag Hunt
 
 Architecture:
-    prompt -> Frozen Qwen3-4B -> action token logits (4,)
-           -> TemperatureAdapter (1 trainable scalar) -> softmax -> action
+    obs -> two-shot prompt
+        -> Qwen3-4B + LoRA (trainable attention adapters)
+        -> sample action from action-token logits
+        -> env.step() -> team reward
+        -> PPO update on LoRA weights + value head
 
 Usage:
     python main.py --mode train
     python main.py --mode train --prompt_type 4
-    python main.py --mode eval  --checkpoint_a checkpoints/agent_A_latest.pt \\
-                                --checkpoint_b checkpoints/agent_B_latest.pt
+    python main.py --mode eval  --checkpoint checkpoints/policy_ep200
+
+Target hardware: L40 (48 GB VRAM)  —  set --partition=l40 in run.sh
 """
 
 import argparse
@@ -32,10 +36,10 @@ from utils.utils import (
     save_rollout_csv,
 )
 from agents.qwen4b import obs_to_prompt
-from agents.llm_policy_agent import LLMPolicy, REINFORCEAgent
+from agents.llm_policy_agent import QwenLoRAPolicy, PPOAgent
 
 import os
-os.environ["HF_HOME"]           = "/scratch.hpc/matteo.preda/hf_cache"
+os.environ["HF_HOME"]            = "/scratch.hpc/matteo.preda/hf_cache"
 os.environ["TRANSFORMERS_CACHE"] = "/scratch.hpc/matteo.preda/hf_cache"
 
 
@@ -52,23 +56,31 @@ CONFIG = {
     "forage_reward":      1,
     "mauling_punishment": -5,
 
-    # Prompt type: "2"=zero-shot  "3"=one-shot  "4"=two-shot
-    "prompt_type":        "4",
+    # Prompt
+    "prompt_type":        "4",   # 2=zero-shot  3=one-shot  4=two-shot
 
     # Training
     "total_episodes":     500,
 
-    # REINFORCE — higher lr is fine: only 1 scalar param per agent
-    "gamma":              0.99,
-    "lr":                 1e-2,
+    # PPO hyperparameters
+    "lr":        1e-4,    # AdamW lr for LoRA params
+    "gamma":     0.99,    # discount factor
+    "clip_eps":  0.2,     # PPO clip ratio
+    "vf_coeff":  0.5,     # value loss coefficient
+    "ent_coeff": 0.01,    # entropy bonus coefficient
+
+    # LoRA
+    "lora_rank":    16,
+    "lora_alpha":   32,
+    "lora_dropout": 0.05,
 
     # Checkpointing
-    "checkpoint_dir":     "checkpoints",
-    "checkpoint_every":   50,
+    "checkpoint_dir":   "checkpoints",
+    "checkpoint_every": 50,
 
     # Evaluation
-    "eval_episodes":      20,
-    "save_video":         True,
+    "eval_episodes": 20,
+    "save_video":    True,
 }
 
 
@@ -78,14 +90,14 @@ CONFIG = {
 
 def make_env(load_renderer: bool = False):
     return ENV_FACTORIES[CONFIG["env_name"]](
-        obs_type="coords",
-        load_renderer=load_renderer,
-        enable_multiagent=True,
-        grid_size=CONFIG["grid_size"],
-        max_timesteps=CONFIG["max_timesteps"],
-        stag_reward=CONFIG["stag_reward"],
-        forage_reward=CONFIG["forage_reward"],
-        mauling_punishment=CONFIG["mauling_punishment"],
+        obs_type        = "coords",
+        load_renderer   = load_renderer,
+        enable_multiagent = True,
+        grid_size       = CONFIG["grid_size"],
+        max_timesteps   = CONFIG["max_timesteps"],
+        stag_reward     = CONFIG["stag_reward"],
+        forage_reward   = CONFIG["forage_reward"],
+        mauling_punishment = CONFIG["mauling_punishment"],
     )
 
 
@@ -94,21 +106,23 @@ def make_env(load_renderer: bool = False):
 # ---------------------------------------------------------------------------
 
 def run_episode(
-    agent_a: REINFORCEAgent,
-    agent_b: REINFORCEAgent,
+    agent_a: PPOAgent,
+    agent_b: PPOAgent,
     episode_idx: int,
-    training: bool = True,
+    training:    bool = True,
     save_video_path: str | None = None,
 ) -> list[RolloutFrame]:
     """
-    Run one full episode.
+    Run one full episode with both PPO agents.
 
-    Reward signal (training only):
+    Reward:
         team_reward = raw_r_a + raw_r_b  (shared, no shaping)
-        Both agents receive the same team_reward at every step so each
-        agent cares about its partner's outcome.
+        Both agents receive the same team reward — each agent cares
+        about its partner's outcome without being told how to cooperate.
 
-    Raw per-agent rewards are stored in RolloutFrame for clean logging.
+    Both agents share the same QwenLoRAPolicy so both sets of
+    (log_prob, value, entropy) computed in this episode contribute
+    to the same PPO update — doubling the effective batch size.
     """
     load_renderer = save_video_path is not None
     env = make_env(load_renderer=load_renderer)
@@ -116,12 +130,12 @@ def run_episode(
 
     frames: list[RolloutFrame] = []
     frames.append(RolloutFrame(
-        step=0,
-        obs=obs,
-        actions=None,
-        rewards=None,
-        pixel_frame=get_pixel_frame(env, multiagent=True) if load_renderer else None,
-        info=info,
+        step        = 0,
+        obs         = obs,
+        actions     = None,
+        rewards     = None,
+        pixel_frame = get_pixel_frame(env, multiagent=True) if load_renderer else None,
+        info        = info,
     ))
 
     mode_str = "Train" if training else "Eval"
@@ -129,10 +143,10 @@ def run_episode(
     if TQDM_AVAILABLE:
         step_iter = tqdm(
             range(1, CONFIG["max_timesteps"] + 1),
-            desc=f"  {mode_str} ep {episode_idx} steps",
-            unit="step",
-            leave=False,
-            dynamic_ncols=True,
+            desc         = f"  {mode_str} ep {episode_idx} steps",
+            unit         = "step",
+            leave        = False,
+            dynamic_ncols = True,
         )
     else:
         step_iter = range(1, CONFIG["max_timesteps"] + 1)
@@ -140,34 +154,26 @@ def run_episode(
     for step in step_iter:
         step_t0 = time.time()
 
-        # Build prompts — obs_to_prompt returns (prompt_A, prompt_B)
         prompt_a, prompt_b = obs_to_prompt(obs, prompot_type=CONFIG["prompt_type"])
 
-        # Get action logits from frozen LLM (state-dependent next-token probs)
-        logits_a = agent_a.get_action_logits(prompt_a)
-        logits_b = agent_b.get_action_logits(prompt_b)
+        action_a = agent_a.select_action(prompt_a, greedy=not training)
+        action_b = agent_b.select_action(prompt_b, greedy=not training)
 
-        # TemperatureAdapter scales logits -> sample or argmax
-        action_a = agent_a.select_action(logits_a, greedy=not training)
-        action_b = agent_b.select_action(logits_b, greedy=not training)
-
-        # Step environment
         next_obs, rewards, terminated, truncated, info = env.step([action_a, action_b])
         raw_r_a, raw_r_b = float(rewards[0]), float(rewards[1])
 
-        # Shared team reward — no shaping
         if training:
             team_reward = raw_r_a + raw_r_b
             agent_a.store_reward(team_reward)
             agent_b.store_reward(team_reward)
 
         frames.append(RolloutFrame(
-            step=step,
-            obs=next_obs,
-            actions=[action_a, action_b],
-            rewards=(raw_r_a, raw_r_b),
-            pixel_frame=get_pixel_frame(env, multiagent=True) if load_renderer else None,
-            info=info,
+            step        = step,
+            obs         = next_obs,
+            actions     = [action_a, action_b],
+            rewards     = (raw_r_a, raw_r_b),
+            pixel_frame = get_pixel_frame(env, multiagent=True) if load_renderer else None,
+            info        = info,
         ))
 
         step_elapsed = time.time() - step_t0
@@ -192,11 +198,11 @@ def run_episode(
         if terminated or truncated:
             break
 
-    # REINFORCE update — one per episode, after all steps
+    # PPO update — one per episode, after all steps collected
     if training:
-        agent_a.update()
-        agent_b.update()
-
+        loss_a = agent_a.update()
+        loss_b = agent_b.update()
+    
     if save_video_path and load_renderer:
         save_rollout_video(frames, output_path=save_video_path, fps=4)
         print(f"  Video saved -> {save_video_path}")
@@ -247,27 +253,56 @@ def train(prompt_type: str | None = None):
         CONFIG["prompt_type"] = prompt_type
 
     print("=" * 65)
-    print(f"  TRAINING: LLM Token-Logit REINFORCE")
-    print(f"  prompt_type={CONFIG['prompt_type']} | lr={CONFIG['lr']} | gamma={CONFIG['gamma']}")
-    print(f"  trainable params: 1 temperature scalar per agent")
+    print(f"  TRAINING: Qwen3-4B LoRA + PPO on Stag Hunt")
+    print(f"  prompt_type={CONFIG['prompt_type']} | lr={CONFIG['lr']}")
+    print(f"  lora_rank={CONFIG['lora_rank']} | clip_eps={CONFIG['clip_eps']}")
     print("=" * 65)
 
     ckpt_dir = Path(CONFIG["checkpoint_dir"])
     ckpt_dir.mkdir(exist_ok=True)
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
-    print(f"Device: {device}\n")
+    print(f"Device: {device}")
+    if device == "cuda":
+        print(f"GPU: {torch.cuda.get_device_name(0)}")
+        print(f"VRAM: {torch.cuda.get_device_properties(0).total_memory / 1e9:.1f} GB\n")
 
-    llm     = LLMPolicy(device=device)
-    agent_a = REINFORCEAgent(llm, agent_id="A", lr=CONFIG["lr"], gamma=CONFIG["gamma"])
-    agent_b = REINFORCEAgent(llm, agent_id="B", lr=CONFIG["lr"], gamma=CONFIG["gamma"])
+    # Both agents share one policy (same LoRA weights, different rollout buffers)
+    policy  = QwenLoRAPolicy(
+        device       = device,
+        lora_rank    = CONFIG["lora_rank"],
+        lora_alpha   = CONFIG["lora_alpha"],
+        lora_dropout = CONFIG["lora_dropout"],
+    )
+    agent_a = PPOAgent(
+        policy    = policy,
+        agent_id  = "A",
+        lr        = CONFIG["lr"],
+        gamma     = CONFIG["gamma"],
+        clip_eps  = CONFIG["clip_eps"],
+        vf_coeff  = CONFIG["vf_coeff"],
+        ent_coeff = CONFIG["ent_coeff"],
+    )
+    agent_b = PPOAgent(
+        policy    = policy,
+        agent_id  = "B",
+        lr        = CONFIG["lr"],
+        gamma     = CONFIG["gamma"],
+        clip_eps  = CONFIG["clip_eps"],
+        vf_coeff  = CONFIG["vf_coeff"],
+        ent_coeff = CONFIG["ent_coeff"],
+    )
 
-    ckpt_a = ckpt_dir / "agent_A_latest.pt"
-    ckpt_b = ckpt_dir / "agent_B_latest.pt"
+    # Resume from checkpoint if available
+    ckpt_policy = str(ckpt_dir / "policy_latest")
+    ckpt_a_opt  = str(ckpt_dir / "agent_A_latest")
+    ckpt_b_opt  = str(ckpt_dir / "agent_B_latest")
     start_episode = 1
-    if ckpt_a.exists() and ckpt_b.exists():
-        agent_a.load(str(ckpt_a))
-        agent_b.load(str(ckpt_b))
+
+    if Path(ckpt_policy + "_lora").exists():
+        policy.load(ckpt_policy)
+        agent_a.load(ckpt_a_opt)
+        agent_b.load(ckpt_b_opt)
         start_episode = len(agent_a.episode_return_history) + 1
         print(f"Resuming from episode {start_episode}\n")
 
@@ -276,9 +311,9 @@ def train(prompt_type: str | None = None):
     if TQDM_AVAILABLE:
         ep_bar = tqdm(
             range(start_episode, total_eps + 1),
-            desc="Training episodes",
-            unit="ep",
-            dynamic_ncols=True,
+            desc          = "Training episodes",
+            unit          = "ep",
+            dynamic_ncols = True,
         )
     else:
         ep_bar = range(start_episode, total_eps + 1)
@@ -293,10 +328,6 @@ def train(prompt_type: str | None = None):
         loss_a = agent_a.loss_history[-1] if agent_a.loss_history else 0.0
         loss_b = agent_b.loss_history[-1] if agent_b.loss_history else 0.0
 
-        # Log the temperature values — key diagnostic for Option B
-        temp_a = agent_a.adapter.temperature
-        temp_b = agent_b.adapter.temperature
-
         summary = (
             f"Ep {episode:>4}/{total_eps} | "
             f"steps={metrics['steps']:>3} | "
@@ -305,8 +336,6 @@ def train(prompt_type: str | None = None):
             f"team={metrics['total_team_reward']:>8.2f} | "
             f"catches={metrics['n_catches']:>2} | "
             f"maulings={metrics['n_maulings']:>2} | "
-            f"T_A={temp_a:.4f} | "
-            f"T_B={temp_b:.4f} | "
             f"loss_A={loss_a:>8.4f} | "
             f"loss_B={loss_b:>8.4f} | "
             f"ep_time={ep_elapsed:.1f}s"
@@ -314,26 +343,28 @@ def train(prompt_type: str | None = None):
 
         if TQDM_AVAILABLE:
             ep_bar.set_postfix({
-                "team":    f"{metrics['total_team_reward']:.1f}",
-                "catches": metrics["n_catches"],
-                "T_A":     f"{temp_a:.3f}",
-                "loss_A":  f"{loss_a:.4f}",
-                "ep_time": f"{ep_elapsed:.1f}s",
+                "team":     f"{metrics['total_team_reward']:.1f}",
+                "catches":  metrics["n_catches"],
+                "loss_A":   f"{loss_a:.4f}",
+                "ep_time":  f"{ep_elapsed:.1f}s",
             })
             tqdm.write(summary)
         else:
             print(summary)
 
         if episode % CONFIG["checkpoint_every"] == 0:
-            agent_a.save(str(ckpt_dir / f"agent_A_ep{episode}.pt"))
-            agent_b.save(str(ckpt_dir / f"agent_B_ep{episode}.pt"))
-            agent_a.save(str(ckpt_a))
-            agent_b.save(str(ckpt_b))
+            ep_tag = str(ckpt_dir / f"policy_ep{episode}")
+            policy.save(ep_tag)
+            agent_a.save(str(ckpt_dir / f"agent_A_ep{episode}"))
+            agent_b.save(str(ckpt_dir / f"agent_B_ep{episode}"))
+            policy.save(ckpt_policy)
+            agent_a.save(ckpt_a_opt)
+            agent_b.save(ckpt_b_opt)
 
             save_rollout_csv(
-                multiagent=True,
-                frames=frames,
-                output_path=str(ckpt_dir / f"rollout_ep{episode}.csv"),
+                multiagent  = True,
+                frames      = frames,
+                output_path = str(ckpt_dir / f"rollout_ep{episode}.csv"),
             )
 
             window = min(CONFIG["checkpoint_every"], episode)
@@ -342,16 +373,16 @@ def train(prompt_type: str | None = None):
             rolling = (
                 f"\n  --- checkpoint ep {episode} | last {window} eps | "
                 f"avg team_R (A)={sum(hist_a)/window:.2f} "
-                f"(B)={sum(hist_b)/window:.2f} | "
-                f"T_A={temp_a:.4f} T_B={temp_b:.4f} ---\n"
+                f"(B)={sum(hist_b)/window:.2f} ---\n"
             )
             if TQDM_AVAILABLE:
                 tqdm.write(rolling)
             else:
                 print(rolling)
 
-    agent_a.save(str(ckpt_dir / "agent_A_final.pt"))
-    agent_b.save(str(ckpt_dir / "agent_B_final.pt"))
+    policy.save(str(ckpt_dir / "policy_final"))
+    agent_a.save(str(ckpt_dir / "agent_A_final"))
+    agent_b.save(str(ckpt_dir / "agent_B_final"))
     print("\nTraining complete.")
 
 
@@ -359,19 +390,21 @@ def train(prompt_type: str | None = None):
 # Evaluation
 # ---------------------------------------------------------------------------
 
-def evaluate(checkpoint_a: str, checkpoint_b: str):
+def evaluate(checkpoint: str):
     print("=" * 65)
-    print("  EVALUATION: LLM Token-Logit REINFORCE on Stag Hunt")
+    print("  EVALUATION: Qwen3-4B LoRA + PPO on Stag Hunt")
     print("=" * 65)
 
-    device  = "cuda" if torch.cuda.is_available() else "cpu"
-    llm     = LLMPolicy(device=device)
-    agent_a = REINFORCEAgent(llm, agent_id="A", lr=CONFIG["lr"], gamma=CONFIG["gamma"])
-    agent_b = REINFORCEAgent(llm, agent_id="B", lr=CONFIG["lr"], gamma=CONFIG["gamma"])
-    agent_a.load(checkpoint_a)
-    agent_b.load(checkpoint_b)
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    policy  = QwenLoRAPolicy(device=device)
+    agent_a = PPOAgent(policy=policy, agent_id="A",
+                       lr=CONFIG["lr"], gamma=CONFIG["gamma"])
+    agent_b = PPOAgent(policy=policy, agent_id="B",
+                       lr=CONFIG["lr"], gamma=CONFIG["gamma"])
 
-    print(f"  Loaded T_A={agent_a.adapter.temperature:.4f}  T_B={agent_b.adapter.temperature:.4f}")
+    policy.load(checkpoint)
+    agent_a.load(checkpoint.replace("policy", "agent_A"))
+    agent_b.load(checkpoint.replace("policy", "agent_B"))
 
     total_catches  = 0
     total_maulings = 0
@@ -382,7 +415,8 @@ def evaluate(checkpoint_a: str, checkpoint_b: str):
     n = CONFIG["eval_episodes"]
 
     if TQDM_AVAILABLE:
-        ep_bar = tqdm(range(1, n + 1), desc="Eval episodes", unit="ep", dynamic_ncols=True)
+        ep_bar = tqdm(range(1, n + 1), desc="Eval episodes",
+                      unit="ep", dynamic_ncols=True)
     else:
         ep_bar = range(1, n + 1)
 
@@ -400,7 +434,8 @@ def evaluate(checkpoint_a: str, checkpoint_b: str):
         total_r_b      += metrics["total_reward_b"]
         total_steps    += metrics["steps"]
 
-        save_rollout_csv(multiagent=True, frames=frames, output_path=f"eval_ep{ep}.csv")
+        save_rollout_csv(multiagent=True, frames=frames,
+                         output_path=f"eval_ep{ep}.csv")
 
         summary = (
             f"Eval {ep:>3}/{n} | "
@@ -414,7 +449,7 @@ def evaluate(checkpoint_a: str, checkpoint_b: str):
         )
         if TQDM_AVAILABLE:
             ep_bar.set_postfix({
-                "team": f"{metrics['total_team_reward']:.1f}",
+                "team":    f"{metrics['total_team_reward']:.1f}",
                 "catches": metrics["n_catches"],
                 "ep_time": f"{ep_elapsed:.1f}s",
             })
@@ -431,8 +466,6 @@ def evaluate(checkpoint_a: str, checkpoint_b: str):
     print(f"  Total catches:         {total_catches}")
     print(f"  Catch rate (per step): {100*total_catches/max(total_steps,1):.2f}%")
     print(f"  Total maulings:        {total_maulings}")
-    print(f"  Final T_A:             {agent_a.adapter.temperature:.4f}")
-    print(f"  Final T_B:             {agent_b.adapter.temperature:.4f}")
     print(f"{'='*65}")
 
 
@@ -445,11 +478,11 @@ if __name__ == "__main__":
     parser.add_argument("--mode",         choices=["train", "eval"], default="train")
     parser.add_argument("--prompt_type",  choices=["2", "3", "4"],   default="4",
                         help="2=zero-shot  3=one-shot  4=two-shot")
-    parser.add_argument("--checkpoint_a", default="checkpoints/agent_A_latest.pt")
-    parser.add_argument("--checkpoint_b", default="checkpoints/agent_B_latest.pt")
+    parser.add_argument("--checkpoint",   default="checkpoints/policy_latest",
+                        help="Path prefix for eval (without _lora suffix)")
     args = parser.parse_args()
 
     if args.mode == "train":
         train(prompt_type=args.prompt_type)
     else:
-        evaluate(args.checkpoint_a, args.checkpoint_b)
+        evaluate(args.checkpoint)

@@ -31,6 +31,8 @@ setup(
         "transformers>=4.40.0",
         "accelerate>=0.27.0",
         "bitsandbytes>=0.43.0",     # 4-bit quantization (QLoRA)
+        "peft>=0.12.0",
+        "trl>=0.7.0",
 
         # --- RL training ---
         "torch>=2.2.0",
