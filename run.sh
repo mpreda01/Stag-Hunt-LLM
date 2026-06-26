@@ -11,10 +11,7 @@
 #SBATCH --chdir=/scratch.hpc/matteo.preda/Stag-Hunt-LLM
 #SBATCH --gres=gpu:1
 
-# =============================================================================
-# run.sh — SLURM job for Qwen3-4B LoRA+PPO training on Stag Hunt
-# Target: L40 node (48 GB VRAM)
-# =============================================================================
+
 
 set -e
 
