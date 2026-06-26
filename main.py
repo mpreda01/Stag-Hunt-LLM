@@ -40,7 +40,7 @@ from utils.utils import (
     save_rollout_video,
     save_rollout_csv,
 )
-from visual_policy import DQNAgent
+from agents.visual_policy import DQNAgent
 
 
 # ---------------------------------------------------------------------------
