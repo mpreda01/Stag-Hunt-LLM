@@ -32,7 +32,7 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 
-from qwen3b import (
+from agents.qwen3b import (
     QwenStagHuntPolicy,
     generate_stag_hunt_prompt,
     parse_llm_output,
