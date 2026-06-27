@@ -30,12 +30,12 @@
 # ---- GPU PARTITION: uncomment ONE block ----
 
 # # Option A: L40 (48 GB)  — recommended
-# #SBATCH --partition=l40
-# #SBATCH --gres=gpu:1
+#SBATCH --partition=l40
+#SBATCH --gres=gpu:1
 
 # Option B: RTX 2080 (11 GB)  — only for quick smoke-tests
-#SBATCH --partition=rtx2080
-#SBATCH --gres=gpu:1
+# #SBATCH --partition=rtx2080
+# #SBATCH --gres=gpu:1
 
 # ---- Output ----
 #SBATCH --output=/scratch.hpc/matteo.preda/logs/grpo_%j.out
