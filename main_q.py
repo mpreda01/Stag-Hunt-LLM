@@ -17,6 +17,17 @@ Architecture
     train_agent         (main loop, checkpointing, metric logging)
 """
 
+# ---------------------------------------------------------------------------
+# Ensure the project root is on sys.path so `import qwen3b` always resolves,
+# regardless of the working directory Python is launched from.
+# setup_q.sh installs a .pth file for the permanent fix; this is the runtime
+# belt-and-suspenders for cases where the venv is used without that .pth.
+# ---------------------------------------------------------------------------
+import sys
+import os as _os
+sys.path.insert(0, _os.path.dirname(_os.path.abspath(__file__)))
+# ---------------------------------------------------------------------------
+
 import argparse
 import csv
 import json
@@ -32,7 +43,7 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 
-from agents.qwen3b import (
+from qwen3b import (
     QwenStagHuntPolicy,
     generate_stag_hunt_prompt,
     parse_llm_output,
@@ -692,7 +703,6 @@ if __name__ == "__main__":
         lora_rank       = cfg.lora_rank,
         lora_alpha      = cfg.lora_alpha,
         max_new_tokens  = cfg.max_new_tokens,
-        temperature     = cfg.temperature,
     )
 
     if args.checkpoint is not None:
