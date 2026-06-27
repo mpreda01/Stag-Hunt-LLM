@@ -4,7 +4,7 @@ import pandas as pd
 from pathlib import Path
 from dataclasses import dataclass, field
 from typing import Any
-from agents.qwen4b import query_llm, obs_to_prompt
+from agents.qwen4b_IFT import query_llm, obs_to_prompt
 import time
 from agents.random_policy import random_policy
 
