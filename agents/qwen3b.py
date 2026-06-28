@@ -230,6 +230,10 @@ class QwenStagHuntPolicy:
         self.max_new_tokens = max_new_tokens
         self.model_name     = model_name
 
+        # Prevent tokenizer from spawning threads that can deadlock on SLURM
+        import os
+        os.environ["TOKENIZERS_PARALLELISM"] = "false"
+
         bnb_config = BitsAndBytesConfig(
             load_in_4bit              = True,
             bnb_4bit_quant_type       = "nf4",
@@ -237,19 +241,25 @@ class QwenStagHuntPolicy:
             bnb_4bit_use_double_quant = True,
         )
 
-        print(f"[QwenStagHuntPolicy] Loading {model_name} in 4-bit NF4 …")
+        print(f"[QwenStagHuntPolicy] Loading tokenizer for {model_name} …", flush=True)
         self.tokenizer = AutoTokenizer.from_pretrained(
             model_name,
-            padding_side = "left",
+            padding_side  = "left",
+            use_fast      = False,   # fast tokenizer uses Rust threads — avoid on SLURM
         )
         if self.tokenizer.pad_token_id is None:
             self.tokenizer.pad_token_id = self.tokenizer.eos_token_id
+        print("[QwenStagHuntPolicy] Tokenizer loaded.", flush=True)
 
+        print(f"[QwenStagHuntPolicy] Loading model weights in 4-bit NF4 …", flush=True)
         base_model = AutoModelForCausalLM.from_pretrained(
             model_name,
             quantization_config = bnb_config,
-            device_map          = device,
+            device_map          = {"": device},  # explicit single-device, no parallelism
+            torch_dtype         = torch.float16,
+            low_cpu_mem_usage   = True,
         )
+        print("[QwenStagHuntPolicy] Base model loaded.", flush=True)
 
         lora_config = LoraConfig(
             task_type    = TaskType.CAUSAL_LM,

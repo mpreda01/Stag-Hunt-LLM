@@ -60,6 +60,9 @@ export PIP_CACHE_DIR="/scratch.hpc/matteo.preda/pip_cache"
 export TMPDIR="/scratch.hpc/matteo.preda/tmp"
 # Reduce CUDA allocator fragmentation (recommended in OOM traceback)
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
+# Prevent tokenizer/OpenMP thread deadlocks on SLURM nodes
+export TOKENIZERS_PARALLELISM=false
+export OMP_NUM_THREADS=1
 
 mkdir -p "$CACHE_DIR" \
          "/scratch.hpc/matteo.preda/torch_cache" \
