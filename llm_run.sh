@@ -25,17 +25,17 @@
 #SBATCH --time=24:00:00
 #SBATCH --nodes=1
 #SBATCH --ntasks-per-node=1
-#SBATCH --cpus-per-task=4
+#SBATCH --cpus-per-task=8
 
 # ---- GPU PARTITION: uncomment ONE block ----
 
-# # Option A: L40 (48 GB)  — recommended
+# Option A: L40 (48 GB)  — recommended
 #SBATCH --partition=l40
 #SBATCH --gres=gpu:1
 
 # Option B: RTX 2080 (11 GB)  — only for quick smoke-tests
-# #SBATCH --partition=rtx2080
-# #SBATCH --gres=gpu:1
+##SBATCH --partition=rtx2080
+##SBATCH --gres=gpu:1
 
 # ---- Output ----
 #SBATCH --output=/scratch.hpc/matteo.preda/logs/grpo_%j.out
@@ -58,6 +58,8 @@ export HF_DATASETS_CACHE="$CACHE_DIR/datasets"
 export TORCH_HOME="/scratch.hpc/matteo.preda/torch_cache"
 export PIP_CACHE_DIR="/scratch.hpc/matteo.preda/pip_cache"
 export TMPDIR="/scratch.hpc/matteo.preda/tmp"
+# Reduce CUDA allocator fragmentation (recommended in OOM traceback)
+export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 
 mkdir -p "$CACHE_DIR" \
          "/scratch.hpc/matteo.preda/torch_cache" \

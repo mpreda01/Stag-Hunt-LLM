@@ -432,52 +432,60 @@ class GRPOTrainer:
         """
         Compute GRPO loss over a batch of trajectories and do one gradient step.
 
+        Uses gradient accumulation (immediate .backward() per transition, then
+        one optimizer.step()) to avoid holding all activation graphs in VRAM
+        simultaneously — critical for 4-bit models where dequantization during
+        backprop is memory-intensive.
+
         all_transitions : list of rollout transition lists (one per episode)
         """
-        # Flatten
+        # Flatten all transitions
         flat: list[Transition] = [t for ep in all_transitions for t in ep]
+        n = len(flat)
 
-        rewards_np = np.array([t.reward for t in flat], dtype=np.float32)
         # Normalise advantages globally across the batch
-        mean_r = rewards_np.mean()
-        std_r  = rewards_np.std() + 1e-8
-        advantages = torch.tensor(
-            (rewards_np - mean_r) / std_r,
-            dtype = torch.float32,
-            device = self.cfg.device,
-        )
+        rewards_np = np.array([t.reward for t in flat], dtype=np.float32)
+        mean_r = float(rewards_np.mean())
+        std_r  = float(rewards_np.std()) + 1e-8
+        advantages = (rewards_np - mean_r) / std_r   # numpy array, move to tensor per step
 
-        total_loss   = torch.tensor(0.0, device=self.cfg.device)
-        total_pg     = 0.0
-        total_kl     = 0.0
-        n            = len(flat)
+        total_pg = 0.0
+        total_kl = 0.0
+        total_loss_val = 0.0
 
         self.optimizer.zero_grad()
 
         for i, t in enumerate(flat):
-            adv = advantages[i]
+            adv = torch.tensor(float(advantages[i]), device=self.cfg.device)
 
-            # Current policy log-prob
+            # Current policy log-prob (graph retained for backward)
             log_p = self.policy.log_probs_of_response(t.prompt, t.response)
 
-            # Reference policy log-prob (frozen base model)
+            # Reference log-prob (no grad, base weights via adapter disable)
             ref_log_p = self.policy.reference_log_probs(t.prompt, t.response)
+            ref_log_p = ref_log_p.to(self.cfg.device)
 
-            # PPO-style clipped ratio
-            ratio   = torch.exp(log_p - ref_log_p)
+            # PPO-style clipped surrogate
+            ratio   = torch.exp(log_p - ref_log_p.detach())
             clipped = torch.clamp(ratio, 1.0 - self.cfg.clip_eps, 1.0 + self.cfg.clip_eps)
             pg_loss = -torch.min(ratio * adv, clipped * adv)
 
-            # One-sided KL: max(0, log π_θ - log π_ref)  (simpler than full KL)
-            kl = torch.clamp(log_p - ref_log_p, min=0.0)
+            # One-sided KL penalty against reference
+            kl = torch.clamp(log_p - ref_log_p.detach(), min=0.0)
 
-            loss_i = pg_loss + self.cfg.kl_coeff * kl
-            total_loss = total_loss + loss_i / n
+            # Scale by 1/n so the effective lr is independent of batch size,
+            # then immediately backward to free the activation graph
+            loss_i = (pg_loss + self.cfg.kl_coeff * kl) / n
+            loss_i.backward()
 
-            total_pg += pg_loss.item()
-            total_kl += kl.item()
+            total_pg       += pg_loss.item()
+            total_kl       += kl.item()
+            total_loss_val += loss_i.item()
 
-        total_loss.backward()
+            # Free any leftover GPU cache between transitions
+            torch.cuda.empty_cache()
+
+        # Single optimizer step after all gradients are accumulated
         torch.nn.utils.clip_grad_norm_(
             [p for p in self.policy.model.parameters() if p.requires_grad],
             self.cfg.grad_clip,
@@ -485,11 +493,11 @@ class GRPOTrainer:
         self.optimizer.step()
 
         return {
-            "loss":    total_loss.item(),
-            "pg_loss": total_pg / n,
-            "kl":      total_kl / n,
-            "mean_ret": float(mean_r),
-            "std_ret":  float(std_r),
+            "loss":     total_loss_val,
+            "pg_loss":  total_pg / n,
+            "kl":       total_kl / n,
+            "mean_ret": mean_r,
+            "std_ret":  std_r,
         }
 
 

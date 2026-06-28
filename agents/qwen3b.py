@@ -133,12 +133,15 @@ def generate_stag_hunt_prompt(
         f"  • Stepping on a Hare alone                 → +1 (safe).\n"
         f"  • The Stag moves toward the nearest agent each turn.\n\n"
         f"Instructions:\n"
-        f"  Think step-by-step about your teammate's likely move and whether "
-        f"you can both reach the Stag on the same turn. Express your full "
-        f"reasoning inside <think>…</think> tags. Then output exactly one "
-        f"action word (UP / DOWN / LEFT / RIGHT / STAY) inside "
-        f"<action>…</action> tags.\n\n"
-        f"<think>"
+        f"  1. Reason step-by-step about your teammate's likely move and\n"
+        f"     whether you can both reach the Stag on the same turn.\n"
+        f"  2. Your reply MUST end with this exact line (one word only):\n"
+        f"     <action>WORD</action>\n"
+        f"     where WORD is one of: UP DOWN LEFT RIGHT STAY\n\n"
+        f"Example of a valid reply:\n"
+        f"The stag is one step right and my teammate is converging. I move right.\n"
+        f"<action>RIGHT</action>\n\n"
+        f"Now give your reasoning, then your action tag:"
     )
     return prompt
 
@@ -152,27 +155,38 @@ def parse_llm_output(output_text: str) -> int:
     Extract the action integer from the model's raw text output.
 
     Tries (in order):
-      1. <action>WORD</action> pattern (canonical)
-      2. Bare keyword anywhere in the cleaned text after </think>
-      3. Random fallback
+      1. <action>WORD</action> tag anywhere in the text (canonical)
+      2. Last non-empty line is exactly one action keyword
+      3. Last occurrence of any action keyword in the full text
+      4. Random fallback
 
     Returns
     -------
     int in [0, N_ACTIONS)
     """
-    # Strip the <think> block — we only care about the action declaration
-    post_think = re.sub(r"<think>.*?</think>", "", output_text, flags=re.DOTALL)
-
-    # Primary: tagged action
-    m = _ACTION_PATTERN.search(post_think)
+    # Primary: tagged action anywhere in the full response
+    m = _ACTION_PATTERN.search(output_text)
     if m:
         return ACTION_MAP[m.group(1).upper()]
 
-    # Secondary: bare keyword (model forgot tags but said the word)
-    clean = post_think.upper()
+    # Secondary: last non-empty line contains exactly one action keyword
+    lines = [l.strip() for l in output_text.strip().splitlines() if l.strip()]
+    if lines:
+        last = lines[-1].upper()
+        for word, idx in ACTION_MAP.items():
+            if re.fullmatch(rf"[\W]*{word}[\W]*", last):
+                return idx
+
+    # Tertiary: last occurrence of any action keyword in the full text
+    # (model often restates its decision near the end of its reasoning)
+    best_pos, best_idx = -1, -1
+    upper = output_text.upper()
     for word, idx in ACTION_MAP.items():
-        if re.search(rf"\b{word}\b", clean):
-            return idx
+        for m2 in re.finditer(rf"\b{word}\b", upper):
+            if m2.start() > best_pos:
+                best_pos, best_idx = m2.start(), idx
+    if best_idx >= 0:
+        return best_idx
 
     # Fallback
     fallback = random.randint(0, N_ACTIONS - 1)
