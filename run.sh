@@ -49,8 +49,7 @@ echo "============================================================"
 source "$VENV_DIR/bin/activate"
 echo "==> Python: $(which python3) — $(python3 --version)"
 
-# Install peft if not already present
-python3 -c "import peft" 2>/dev/null || pip install peft --quiet
+export WANDB_API_KEY="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"
 
 echo "==> GPU info:"
 nvidia-smi --query-gpu=name,memory.total,memory.free --format=csv,noheader

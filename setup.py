@@ -39,6 +39,8 @@ setup(
 
         # --- Progress bars ---
         "tqdm",
+        
+        "wandb"
     ],
     classifiers=[
         "Programming Language :: Python :: 3",
@@ -47,3 +49,5 @@ setup(
     ],
     python_requires=">=3.10",   # bumped from 3.9: project uses str | None syntax
 )
+
+

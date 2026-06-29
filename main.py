@@ -23,9 +23,20 @@ Key fix vs previous version:
     after the first episode. set -e in run.sh then silently killed the job
     with only a tqdm "0/1000" line visible in the log.
 
+W&B integration:
+    Every episode logs per-episode metrics (rewards, catches, maulings,
+    epsilon, loss, replay buffer size, episode duration).
+    Every checkpoint_every episodes also logs a rolling-window average.
+    wandb.watch() is called on the online CNN so gradient/weight
+    histograms appear in the W&B UI automatically.
+    On eval, a summary table and (optionally) the eval video are uploaded.
+
 Usage:
     python main.py --mode train
     python main.py --mode eval --checkpoint checkpoints/dqn_latest.pt
+
+    W&B is enabled by default. Disable with --no-wandb (e.g. quick local
+    debugging runs).  Set WANDB_API_KEY in your environment before running.
 """
 
 import argparse
@@ -38,6 +49,13 @@ try:
     TQDM_AVAILABLE = True
 except ImportError:
     TQDM_AVAILABLE = False
+
+try:
+    import wandb
+    WANDB_AVAILABLE = True
+except ImportError:
+    WANDB_AVAILABLE = False
+    print("[W&B] wandb not installed — logging disabled. Run: pip install wandb")
 
 import torch
 import numpy as np
@@ -85,6 +103,10 @@ CONFIG = {
     # Evaluation
     "eval_episodes": 20,
     "save_video":    True,
+
+    # W&B
+    "wandb_project": "stag-hunt-dqn",
+    "wandb_entity":  None,   # set to your W&B username / team name, or leave None
 }
 
 
@@ -274,7 +296,7 @@ def compute_metrics(frames: list[RolloutFrame]) -> dict:
 # Training
 # ---------------------------------------------------------------------------
 
-def train():
+def train(use_wandb: bool = True):
     print("=" * 65)
     print("  TRAINING: Shared DQN (CNN policy) on Stag Hunt")
     print(f"  lr={CONFIG['lr']} | gamma={CONFIG['gamma']}")
@@ -312,10 +334,27 @@ def train():
 
     total_eps = CONFIG["total_episodes"]
 
+    # ------------------------------------------------------------------
+    # W&B initialisation
+    # ------------------------------------------------------------------
+    run = None
+    if use_wandb and WANDB_AVAILABLE:
+        run = wandb.init(
+            project = CONFIG["wandb_project"],
+            entity  = CONFIG["wandb_entity"],   # None → uses your default entity
+            name    = f"dqn-hunt-{time.strftime('%Y%m%d-%H%M%S')}",
+            config  = CONFIG,
+            resume  = "allow",   # safe to resume a crashed run
+            tags    = ["dqn", "hunt", "image-obs", "shared-buffer"],
+        )
+        # Log gradient norms and weight histograms every 100 update steps.
+        # log_freq is in gradient-update steps, not episodes.
+        wandb.watch(agent.online, log="all", log_freq=100)
+        print(f"[W&B] Run URL: {run.url}\n")
+    else:
+        print("[W&B] Logging disabled for this run.\n")
+
     # Create the environment once and reuse it for the entire training run.
-    # Calling env.reset() between episodes is sufficient and avoids the
-    # pygame/display re-initialisation crash that happens when you call
-    # make_env() + env.close() inside the loop every episode.
     print("Creating environment...")
     env = make_env(load_renderer=False)
     print("Environment ready.\n")
@@ -332,15 +371,13 @@ def train():
 
             try:
                 frames = run_episode(
-                    agent       = agent,
-                    env         = env,
-                    episode_idx = episode,
-                    training    = True,
+                    agent          = agent,
+                    env            = env,
+                    episode_idx    = episode,
+                    training       = True,
                     collect_frames = False,
                 )
             except Exception:
-                # Print full traceback so the cause is visible in the SLURM
-                # log even when the job is launched with set -e in run.sh.
                 print(f"\n[ERROR] Episode {episode} crashed with:\n"
                       f"{traceback.format_exc()}", flush=True)
                 raise
@@ -351,6 +388,33 @@ def train():
             ep_elapsed = time.time() - ep_t0
             last_loss  = agent.loss_history[-1] if agent.loss_history else 0.0
 
+            # ----------------------------------------------------------------
+            # W&B — per-episode metrics
+            # ----------------------------------------------------------------
+            if run is not None:
+                wandb.log({
+                    # Rewards
+                    "episode/reward_A":          m["total_reward_a"],
+                    "episode/reward_B":          m["total_reward_b"],
+                    "episode/team_reward":       m["total_team_reward"],
+                    # Cooperation signals
+                    "episode/n_catches":         m["n_catches"],
+                    "episode/n_maulings":        m["n_maulings"],
+                    "episode/catch_rate":        m["n_catches"] / max(m["steps"], 1),
+                    "episode/maul_rate":         m["n_maulings"] / max(m["steps"], 1),
+                    # Training diagnostics
+                    "train/epsilon":             agent.epsilon,
+                    "train/loss":                last_loss,
+                    "train/replay_buffer_size":  len(agent.buffer),
+                    "train/update_count":        agent._update_count,
+                    # Timing
+                    "train/episode_duration_s":  ep_elapsed,
+                    "train/steps_per_episode":   m["steps"],
+                }, step=episode)
+
+            # ----------------------------------------------------------------
+            # Console summary
+            # ----------------------------------------------------------------
             summary = (
                 f"Ep {episode:>4}/{total_eps} | "
                 f"steps={m['steps']:>3} | "
@@ -376,8 +440,12 @@ def train():
             else:
                 print(summary, flush=True)
 
+            # ----------------------------------------------------------------
+            # Checkpoint + W&B rolling-window summary
+            # ----------------------------------------------------------------
             if episode % CONFIG["checkpoint_every"] == 0:
-                agent.save(str(ckpt_dir / f"dqn_ep{episode}.pt"))
+                ckpt_path = str(ckpt_dir / f"dqn_ep{episode}.pt")
+                agent.save(ckpt_path)
                 agent.save(str(ckpt_latest))
 
                 save_rollout_csv(
@@ -388,21 +456,60 @@ def train():
 
                 window  = min(CONFIG["checkpoint_every"], episode)
                 hist    = agent.return_history[-window:]
+                avg_r   = sum(hist) / window
+
                 rolling = (
                     f"\n  --- checkpoint ep {episode} | last {window} eps | "
-                    f"avg team_R = {sum(hist) / window:.2f} ---\n"
+                    f"avg team_R = {avg_r:.2f} ---\n"
                 )
                 if TQDM_AVAILABLE:
                     tqdm.write(rolling)
                 else:
                     print(rolling, flush=True)
 
+                if run is not None:
+                    # Rolling-window averages logged at checkpoint frequency
+                    recent = agent.loss_history[-window * CONFIG["max_timesteps"]:]
+                    avg_loss = sum(recent) / len(recent) if recent else 0.0
+
+                    wandb.log({
+                        f"checkpoint/avg_team_reward_last_{window}ep": avg_r,
+                        f"checkpoint/avg_loss_last_{window}ep":        avg_loss,
+                    }, step=episode)
+
+                    # Save checkpoint as a W&B artifact so it can be
+                    # downloaded and resumed later without SSH access.
+                    artifact = wandb.Artifact(
+                        name = f"dqn-checkpoint-ep{episode}",
+                        type = "model",
+                        metadata = {
+                            "episode":       episode,
+                            "avg_team_reward": avg_r,
+                            "epsilon":       agent.epsilon,
+                        },
+                    )
+                    artifact.add_file(ckpt_path)
+                    run.log_artifact(artifact)
+
     finally:
         # Always save and close cleanly, even if training is interrupted.
         print("\nSaving final checkpoint...")
-        agent.save(str(ckpt_dir / "dqn_final.pt"))
+        final_path = str(ckpt_dir / "dqn_final.pt")
+        agent.save(final_path)
         agent.save(str(ckpt_latest))
         env.close()
+
+        if run is not None:
+            # Upload the final model as a "best / latest" artifact.
+            artifact = wandb.Artifact(
+                name = "dqn-final",
+                type = "model",
+                metadata = {"total_episodes": total_eps},
+            )
+            artifact.add_file(final_path)
+            run.log_artifact(artifact)
+            wandb.finish()
+
         print("Training complete.")
 
 
@@ -410,7 +517,7 @@ def train():
 # Evaluation
 # ---------------------------------------------------------------------------
 
-def evaluate(checkpoint: str):
+def evaluate(checkpoint: str, use_wandb: bool = True):
     print("=" * 65)
     print("  EVALUATION: Shared DQN (CNN policy) on Stag Hunt")
     print("=" * 65)
@@ -429,16 +536,35 @@ def evaluate(checkpoint: str):
     )
     agent.load(checkpoint)
 
+    # ------------------------------------------------------------------
+    # W&B initialisation for eval
+    # ------------------------------------------------------------------
+    run = None
+    if use_wandb and WANDB_AVAILABLE:
+        run = wandb.init(
+            project = CONFIG["wandb_project"],
+            entity  = CONFIG["wandb_entity"],
+            name    = f"eval-{Path(checkpoint).stem}-{time.strftime('%Y%m%d-%H%M%S')}",
+            config  = {**CONFIG, "checkpoint": checkpoint, "mode": "eval"},
+            tags    = ["eval", "dqn", "hunt"],
+        )
+        print(f"[W&B] Run URL: {run.url}\n")
+
     total_catches  = 0
     total_maulings = 0
     total_r_a      = 0.0
     total_r_b      = 0.0
     total_steps    = 0
 
-    n        = CONFIG["eval_episodes"]
+    n = CONFIG["eval_episodes"]
+
+    # W&B Table to log per-episode eval results in a sortable UI widget
+    eval_table = wandb.Table(
+        columns=["episode", "steps", "reward_A", "reward_B",
+                 "team_reward", "catches", "maulings", "catch_rate"]
+    ) if run is not None else None
 
     # For eval ep 1 we want a video, which requires load_renderer=True.
-    # Create a renderer env for that one episode, then switch to a plain env.
     print("Creating environment...")
     env_render = make_env(load_renderer=True)
     env_plain  = make_env(load_renderer=False)
@@ -480,11 +606,40 @@ def evaluate(checkpoint: str):
                 save_rollout_video(frames, output_path=video_path, fps=4)
                 print(f"  Video saved -> {video_path}")
 
+                # Upload the video to W&B so you can watch it in the browser
+                if run is not None:
+                    wandb.log({"eval/rollout_video": wandb.Video(video_path, fps=4, format="mp4")}, step=ep)
+
             save_rollout_csv(
                 multiagent  = True,
                 frames      = frames,
                 output_path = f"eval_ep{ep}.csv",
             )
+
+            catch_rate = m["n_catches"] / max(m["steps"], 1)
+
+            # Per-episode W&B metrics
+            if run is not None:
+                wandb.log({
+                    "eval/reward_A":    m["total_reward_a"],
+                    "eval/reward_B":    m["total_reward_b"],
+                    "eval/team_reward": m["total_team_reward"],
+                    "eval/catches":     m["n_catches"],
+                    "eval/maulings":    m["n_maulings"],
+                    "eval/catch_rate":  catch_rate,
+                    "eval/steps":       m["steps"],
+                }, step=ep)
+
+                eval_table.add_data(
+                    ep,
+                    m["steps"],
+                    m["total_reward_a"],
+                    m["total_reward_b"],
+                    m["total_team_reward"],
+                    m["n_catches"],
+                    m["n_maulings"],
+                    catch_rate,
+                )
 
             summary = (
                 f"Eval {ep:>3}/{n} | "
@@ -508,16 +663,35 @@ def evaluate(checkpoint: str):
         env_render.close()
         env_plain.close()
 
+    # Aggregate results
+    avg_r_a    = total_r_a / n
+    avg_r_b    = total_r_b / n
+    avg_team_r = (total_r_a + total_r_b) / n
+    catch_rate = 100 * total_catches / max(total_steps, 1)
+
     print(f"\n{'=' * 65}")
     print(f"  RESULTS over {n} episodes")
     print(f"{'=' * 65}")
-    print(f"  Avg reward A:          {total_r_a / n:.2f}")
-    print(f"  Avg reward B:          {total_r_b / n:.2f}")
-    print(f"  Avg team reward:       {(total_r_a + total_r_b) / n:.2f}")
+    print(f"  Avg reward A:          {avg_r_a:.2f}")
+    print(f"  Avg reward B:          {avg_r_b:.2f}")
+    print(f"  Avg team reward:       {avg_team_r:.2f}")
     print(f"  Total catches:         {total_catches}")
-    print(f"  Catch rate (per step): {100 * total_catches / max(total_steps, 1):.2f}%")
+    print(f"  Catch rate (per step): {catch_rate:.2f}%")
     print(f"  Total maulings:        {total_maulings}")
     print(f"{'=' * 65}")
+
+    # Upload aggregate summary + table to W&B
+    if run is not None:
+        wandb.log({
+            "eval_summary/avg_reward_A":          avg_r_a,
+            "eval_summary/avg_reward_B":          avg_r_b,
+            "eval_summary/avg_team_reward":       avg_team_r,
+            "eval_summary/total_catches":         total_catches,
+            "eval_summary/catch_rate_pct":        catch_rate,
+            "eval_summary/total_maulings":        total_maulings,
+            "eval_summary/per_episode_results":   eval_table,
+        })
+        wandb.finish()
 
 
 # ---------------------------------------------------------------------------
@@ -536,9 +710,15 @@ if __name__ == "__main__":
         "--checkpoint", default="checkpoints/dqn_latest.pt",
         help="Path to checkpoint for eval (or resume point for train)",
     )
+    parser.add_argument(
+        "--no-wandb", action="store_true",
+        help="Disable W&B logging (useful for quick local tests)",
+    )
     args = parser.parse_args()
 
+    use_wandb = not args.no_wandb
+
     if args.mode == "train":
-        train()
+        train(use_wandb=use_wandb)
     else:
-        evaluate(args.checkpoint)
+        evaluate(args.checkpoint, use_wandb=use_wandb)

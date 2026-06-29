@@ -12,7 +12,7 @@ set -e
 PROJECT_DIR="/scratch.hpc/matteo.preda/Stag-Hunt-LLM"
 VENV_DIR="/scratch.hpc/matteo.preda/rl"
 REPO_URL="https://github.com/mpreda01/Stag-Hunt-LLM.git"
-STAG_HUNT_DIR="/scratch.hpc/matteo.preda/Gymnasium-Stag-Hunt"
+STAG_HUNT_DIR="/scratch.hpc/matteo.preda/Stag-Hunt-LLM"
 
 # ---------------------------------------------------------------------------
 # 1. Create virtual environment
