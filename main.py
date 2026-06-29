@@ -326,6 +326,7 @@ def train(use_wandb: bool = True):
     )
 
     ckpt_latest   = ckpt_dir / "dqn_latest.pt"
+    wandb_id_file = ckpt_dir / "wandb_run_id.txt"   # persists the run ID across SLURM jobs
     start_episode = 1
     if ckpt_latest.exists():
         agent.load(str(ckpt_latest))
@@ -336,17 +337,34 @@ def train(use_wandb: bool = True):
 
     # ------------------------------------------------------------------
     # W&B initialisation
+    #
+    # Key: we persist the wandb run ID to disk alongside the checkpoint.
+    # On resume, we pass that same ID back so W&B appends to the existing
+    # run instead of creating a new one that restarts the x-axis at 0.
     # ------------------------------------------------------------------
     run = None
     if use_wandb and WANDB_AVAILABLE:
+        # Recover the run ID from a previous job if it exists
+        existing_run_id = None
+        if wandb_id_file.exists():
+            existing_run_id = wandb_id_file.read_text().strip()
+            print(f"[W&B] Resuming run ID: {existing_run_id}")
+
         run = wandb.init(
             project = CONFIG["wandb_project"],
-            entity  = CONFIG["wandb_entity"],   # None → uses your default entity
-            name    = f"dqn-hunt-{time.strftime('%Y%m%d-%H%M%S')}",
+            entity  = CONFIG["wandb_entity"],
+            # Keep a stable human-readable name; only set it on the first run
+            # so resumed runs don't get a new timestamped name.
+            name    = f"dqn-hunt" if existing_run_id else f"dqn-hunt-{time.strftime('%Y%m%d-%H%M%S')}",
             config  = CONFIG,
-            resume  = "allow",   # safe to resume a crashed run
+            id      = existing_run_id,   # None on first run → W&B auto-generates one
+            resume  = "must" if existing_run_id else "never",
             tags    = ["dqn", "hunt", "image-obs", "shared-buffer"],
         )
+
+        # Persist the run ID so the next SLURM job can resume correctly
+        wandb_id_file.write_text(run.id)
+
         # Log gradient norms and weight histograms every 100 update steps.
         # log_freq is in gradient-update steps, not episodes.
         wandb.watch(agent.online, log="all", log_freq=100)
