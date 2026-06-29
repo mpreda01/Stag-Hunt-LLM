@@ -17,26 +17,22 @@ import torch
 from transformers import AutoTokenizer, AutoModelForCausalLM, BitsAndBytesConfig
 from peft import LoraConfig, get_peft_model, TaskType
 
+from utils.const import ACTION_MAP
+
 # ---------------------------------------------------------------------------
 # Constants
 # ---------------------------------------------------------------------------
 
 MODEL_NAME = "Qwen/Qwen2.5-3B-Instruct"
 
-ACTION_MAP: dict[str, int] = {
-    "UP":    0,
-    "DOWN":  1,
-    "LEFT":  2,
-    "RIGHT": 3,
-    "STAY":  4,
-}
+
 INT_TO_ACTION: dict[int, str] = {v: k for k, v in ACTION_MAP.items()}
 N_ACTIONS = len(ACTION_MAP)
 
 # Action tokens that the LLM will generate inside <action>…</action>
 # We match only these, then fall back to random.
 _ACTION_PATTERN = re.compile(
-    r"<action>\s*(UP|DOWN|LEFT|RIGHT|STAY)\s*</action>",
+    r"<action>\s*(UP|DOWN|LEFT|RIGHT)\s*</action>",
     re.IGNORECASE,
 )
 
@@ -83,67 +79,17 @@ def generate_stag_hunt_prompt(
     stag_pos:        tuple[int, int],
     hares_positions: list[tuple[int, int]],
     grid_size:       int,
-    history_log:     list[str],
+    history_log:     list[str],          # kept for API compatibility, unused
 ) -> str:
     """
-    Build a Chain-of-Thought prompt that includes Manhattan distances and
-    direction vectors so the model can reason spatially without parsing raw
-    coordinates.
-
-    Parameters
-    ----------
-    agent_pos       : (x, y) of this agent; (0,0) is top-left.
-    teammate_pos    : (x, y) of the cooperating partner.
-    stag_pos        : (x, y) of the stag.
-    hares_positions : list of (x, y) for each hare.
-    grid_size       : side length of the square grid (N×N).
-    history_log     : last few "<AgentX>: ACTION" strings for context.
-
-    Returns
-    -------
-    str  —  full prompt ready to feed to the tokenizer.
+    Minimal prompt: raw coordinates + action choices only (~25 tokens).
+    GRPO tunes the action selection — no prompt engineering needed.
     """
-    stag_rel   = _manhattan_direction(agent_pos, stag_pos)
-    team_rel   = _manhattan_direction(agent_pos, teammate_pos)
-
-    hare_descs: list[str] = []
-    for i, hp in enumerate(hares_positions):
-        rel = _manhattan_direction(agent_pos, hp)
-        hare_descs.append(f"  Hare {i+1}: {hp}  (relative: {rel})")
-    hares_str = "\n".join(hare_descs) if hare_descs else "  None visible"
-
-    history_str = (
-        "\n".join(f"  {h}" for h in history_log[-5:])
-        if history_log
-        else "  No history yet."
+    hares_str = " ".join(f"H:{h}" for h in hares_positions)
+    return (
+        f"A:{agent_pos} T:{teammate_pos} S:{stag_pos} {hares_str} G:{grid_size}\n"
+        f"Action (UP/DOWN/LEFT/RIGHT):"
     )
-
-    prompt = (
-        f"You are an AI Hunter playing the Stag Hunt game on a "
-        f"{grid_size}×{grid_size} grid. Coordinates are (col, row) "
-        f"with (0,0) at the top-left corner.\n\n"
-        f"Your current position : {agent_pos}\n"
-        f"Teammate position     : {teammate_pos}  (relative: {team_rel})\n"
-        f"Stag position         : {stag_pos}  (relative: {stag_rel})\n"
-        f"Hares:\n{hares_str}\n\n"
-        f"Recent action history:\n{history_str}\n\n"
-        f"Rules:\n"
-        f"  • Catching the Stag with your teammate simultaneously → +5 each.\n"
-        f"  • Stepping on the Stag alone               → -5 (mauled).\n"
-        f"  • Stepping on a Hare alone                 → +1 (safe).\n"
-        f"  • The Stag moves toward the nearest agent each turn.\n\n"
-        f"Instructions:\n"
-        f"  1. Reason step-by-step about your teammate's likely move and\n"
-        f"     whether you can both reach the Stag on the same turn.\n"
-        f"  2. Your reply MUST end with this exact line (one word only):\n"
-        f"     <action>WORD</action>\n"
-        f"     where WORD is one of: UP DOWN LEFT RIGHT STAY\n\n"
-        f"Example of a valid reply:\n"
-        f"The stag is one step right and my teammate is converging. I move right.\n"
-        f"<action>RIGHT</action>\n\n"
-        f"Now give your reasoning, then your action tag:"
-    )
-    return prompt
 
 
 # ---------------------------------------------------------------------------
@@ -224,7 +170,7 @@ class QwenStagHuntPolicy:
         lora_rank:   int = 16,
         lora_alpha:  int = 32,
         lora_dropout: float = 0.05,
-        max_new_tokens: int = 256,
+        max_new_tokens: int = 8,
     ):
         self.device         = device
         self.max_new_tokens = max_new_tokens
@@ -255,23 +201,25 @@ class QwenStagHuntPolicy:
         base_model = AutoModelForCausalLM.from_pretrained(
             model_name,
             quantization_config = bnb_config,
-            device_map          = {"": device},  # explicit single-device, no parallelism
-            torch_dtype         = torch.float16,
+            device_map          = {"": device},
+            dtype               = torch.float16,
             low_cpu_mem_usage   = True,
         )
         print("[QwenStagHuntPolicy] Base model loaded.", flush=True)
 
+        print("[QwenStagHuntPolicy] Applying LoRA adapters …", flush=True)
         lora_config = LoraConfig(
-            task_type    = TaskType.CAUSAL_LM,
-            r            = lora_rank,
-            lora_alpha   = lora_alpha,
-            lora_dropout = lora_dropout,
+            task_type      = TaskType.CAUSAL_LM,
+            r              = lora_rank,
+            lora_alpha     = lora_alpha,
+            lora_dropout   = lora_dropout,
             target_modules = ["q_proj", "k_proj", "v_proj", "o_proj"],
-            bias         = "none",
+            bias           = "none",
         )
         self.model = get_peft_model(base_model, lora_config)
+        print("[QwenStagHuntPolicy] LoRA adapters applied.", flush=True)
         self.model.print_trainable_parameters()
-        print(f"[QwenStagHuntPolicy] Ready on {device}.")
+        print(f"[QwenStagHuntPolicy] Ready on {device}.", flush=True)
 
     # ------------------------------------------------------------------
     # Action generation (inference)

@@ -47,8 +47,7 @@ from agents.qwen3b import (
     QwenStagHuntPolicy,
     generate_stag_hunt_prompt,
     parse_llm_output,
-    INT_TO_ACTION,
-    N_ACTIONS,
+    INT_TO_ACTION
 )
 
 
@@ -70,7 +69,7 @@ class TrainConfig:
     model_name:       str   = "Qwen/Qwen2.5-3B-Instruct"
     lora_rank:        int   = 16
     lora_alpha:       int   = 32
-    max_new_tokens:   int   = 256
+    max_new_tokens:   int   = 8
     temperature:      float = 0.8
 
     # GRPO / PG
