@@ -7,3 +7,4 @@ Pipfile.lock
 *.egg-info/
 build
 __pycache__/
+/checkpoints
