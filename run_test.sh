@@ -41,8 +41,8 @@ cd "$PROJECT_DIR"
 #   MODE=2  → Qwen4b zero shot
 #   MODE=3  → Qwen4b one shot
 #   MODE=4  → Qwen4b few shot
-MODE=3
-OUTPUT_PATH="/scratch.hpc/matteo.preda/Stag-Hunt-LLM/outputs/one_shot"
+MODE=4
+OUTPUT_PATH="/scratch.hpc/matteo.preda/Stag-Hunt-LLM/outputs/few_shot"
 
 mkdir -p "$OUTPUT_PATH"
 
