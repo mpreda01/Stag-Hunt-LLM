@@ -44,7 +44,7 @@ nvidia-smi --query-gpu=name,memory.total --format=csv,noheader
 # ---- Install Ollama binary to scratch if not already there ----
 if [ ! -f "$OLLAMA_BIN" ]; then
     echo "==> Ollama not found, downloading to $OLLAMA_BIN ..."
-    curl -fsSL "https://ollama.com/download/ollama-linux-amd64" -o "$OLLAMA_BIN"
+    curl -fsSL "https://github.com/ollama/ollama/releases/latest/download/ollama-linux-amd64" -o "$OLLAMA_BIN"
     chmod +x "$OLLAMA_BIN"
     echo "==> Ollama downloaded."
 else
