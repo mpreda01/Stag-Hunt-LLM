@@ -85,7 +85,10 @@ OUTPUT_PATH="$SCRATCH/Stag-Hunt-LLM/outputs/few_shot/"
 mkdir -p "$OUTPUT_PATH"
 
 echo "==> Running test.py  (mode=$MODE, output=$OUTPUT_PATH)"
-printf "%s\n%s\n" "$MODE" "$OUTPUT_PATH" | python3 test.py
+python3 -u test.py << EOF_INPUT
+$MODE
+$OUTPUT_PATH
+EOF_INPUT
 
 # ---- Cleanup ----
 echo "==> Stopping Ollama server (PID $OLLAMA_PID) ..."
