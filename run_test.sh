@@ -66,8 +66,8 @@ cd "$PROJECT_DIR"
 
 # ---- Run test.py non-interactively ----
 # MODE: 1=random, 2=zero-shot, 3=one-shot, 4=few-shot
-MODE=4
-OUTPUT_PATH="$SCRATCH/Stag-Hunt-LLM/outputs/few_shot/"
+MODE=3
+OUTPUT_PATH="$SCRATCH/Stag-Hunt-LLM/outputs/one_shot/"
 
 mkdir -p "$OUTPUT_PATH"
 
