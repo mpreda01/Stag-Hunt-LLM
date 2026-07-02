@@ -16,11 +16,22 @@ set -e
 
 PROJECT_DIR="/scratch.hpc/matteo.preda/Stag-Hunt-LLM"
 VENV_DIR="/scratch.hpc/matteo.preda/rl"
+SCRATCH="/scratch.hpc/matteo.preda"
 
-export HF_HOME="/scratch.hpc/matteo.preda/hf_cache"
+# ---- Redirect ALL caches to scratch to avoid home quota ----
+export HF_HOME="$SCRATCH/hf_cache"
 export TOKENIZERS_PARALLELISM=false
 export OMP_NUM_THREADS=1
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
+
+# Fix: redirect mesa shader cache away from home (was filling quota)
+export MESA_SHADER_CACHE_DIR="$SCRATCH/mesa_cache"
+export XDG_CACHE_HOME="$SCRATCH/xdg_cache"
+mkdir -p "$SCRATCH/mesa_cache" "$SCRATCH/xdg_cache"
+
+# Ollama stores models here — keep off home quota
+export OLLAMA_MODELS="$SCRATCH/ollama_models"
+mkdir -p "$OLLAMA_MODELS"
 
 echo "============================================================"
 echo "  Job ID : $SLURM_JOB_ID"
@@ -32,22 +43,40 @@ source "$VENV_DIR/bin/activate"
 echo "==> Python: $(which python3) — $(python3 --version)"
 nvidia-smi --query-gpu=name,memory.total --format=csv,noheader
 
+# ---- Start Ollama server in the background ----
+echo "==> Starting Ollama server ..."
+ollama serve &
+OLLAMA_PID=$!
+
+# Wait until Ollama is ready to accept connections (max 60s)
+echo "==> Waiting for Ollama to be ready ..."
+for i in $(seq 1 60); do
+    if ollama list > /dev/null 2>&1; then
+        echo "==> Ollama ready after ${i}s"
+        break
+    fi
+    sleep 1
+done
+
+# Pull the model if not already cached in OLLAMA_MODELS
+echo "==> Checking qwen3:4b-q4_K_M model ..."
+ollama pull qwen3:4b-q4_K_M
+
 cd "$PROJECT_DIR"
 
-# test.py uses input() which won't work in a batch job.
-# We pipe in the mode and output path non-interactively.
-# Edit MODE and OUTPUT_PATH below to change behaviour:
-#   MODE=1  → random agent
-#   MODE=2  → Qwen4b zero shot
-#   MODE=3  → Qwen4b one shot
-#   MODE=4  → Qwen4b few shot
+# ---- Run test.py non-interactively ----
+# MODE: 1=random, 2=zero-shot, 3=one-shot, 4=few-shot
 MODE=4
-OUTPUT_PATH="/scratch.hpc/matteo.preda/Stag-Hunt-LLM/outputs/few_shot"
+OUTPUT_PATH="$SCRATCH/Stag-Hunt-LLM/outputs/few_shot/"
 
 mkdir -p "$OUTPUT_PATH"
 
 echo "==> Running test.py  (mode=$MODE, output=$OUTPUT_PATH)"
 printf "%s\n%s\n" "$MODE" "$OUTPUT_PATH" | python3 test.py
+
+# ---- Cleanup: stop Ollama server ----
+echo "==> Stopping Ollama server (PID $OLLAMA_PID) ..."
+kill "$OLLAMA_PID" 2>/dev/null || true
 
 echo ""
 echo "============================================================"
