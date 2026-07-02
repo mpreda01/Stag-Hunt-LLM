@@ -26,10 +26,11 @@ export OMP_NUM_THREADS=1
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 export MESA_SHADER_CACHE_DIR="$SCRATCH/mesa_cache"
 export XDG_CACHE_HOME="$SCRATCH/xdg_cache"
-export OLLAMA_MODELS="$SCRATCH/ollama_models"
+export OLLAMA_HOME="$SCRATCH/ollama_home"
+export OLLAMA_MODELS="$SCRATCH/ollama_home/models"
 export OLLAMA_HOST="127.0.0.1:11434"
 
-mkdir -p "$SCRATCH/bin" "$SCRATCH/mesa_cache" "$SCRATCH/xdg_cache" "$OLLAMA_MODELS"
+mkdir -p "$SCRATCH/bin" "$SCRATCH/mesa_cache" "$SCRATCH/xdg_cache" "$OLLAMA_HOME" "$OLLAMA_MODELS"
 
 echo "============================================================"
 echo "  Job ID : $SLURM_JOB_ID"
